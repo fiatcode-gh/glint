@@ -126,7 +126,25 @@ mod tests {
 
     #[test]
     fn a_very_large_attempt_number_does_not_overflow() {
+        // `cumulative_through` is overflow-free by construction: the
+        // `attempt >= CAP_ATTEMPT` branch guards the subtraction, and the
+        // saturating multiply and add stop at u32::MAX instead of wrapping.
+        //
+        // `2 + (1 << 29)` is the interesting input, not the far extreme: it is
+        // the first attempt whose capped-attempt count reaches 536870912, and
+        // 536870912 * 8 is the first product that crosses u32::MAX. So this
+        // case exercises the `saturating_mul` boundary itself.
         // act & assert
+        assert_eq!(next_delay(2 + (1 << 29), 10_000), Retry::GiveUp);
         assert_eq!(next_delay(u32::MAX, 10_000), Retry::GiveUp);
+    }
+
+    #[test]
+    fn the_cap_seconds_are_the_delay_the_doubling_reaches_at_the_cap_attempt() {
+        // The closed-form sum in `cumulative_through` only holds while the cap
+        // is exactly the doubled delay at CAP_ATTEMPT. The two constants are
+        // written out separately on purpose, so this test is what ties them.
+        // act & assert
+        assert_eq!(BACKOFF_CAP_SECS, 1 << CAP_ATTEMPT);
     }
 }

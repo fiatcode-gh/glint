@@ -44,7 +44,6 @@ impl Default for Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::Encoder;
 
     #[test]
     fn defaults_match_the_contract() {
@@ -107,6 +106,35 @@ mod tests {
         assert_eq!(settings.retry_timeout_secs, 30);
         assert!(settings.audio_follows_screen);
         assert_eq!(settings.preferred_encoder, None);
+    }
+
+    #[test]
+    fn the_encoder_wire_spellings_are_the_settings_file_format() {
+        // These three literals ARE the on-disk format. A round-trip test cannot
+        // catch a rename, because the serialiser and the deserialiser move
+        // together — only the spelled-out strings pin them.
+        // arrange
+        let cases = [
+            ("vah264", Encoder::VaH264),
+            ("x264", Encoder::X264),
+            ("openh264", Encoder::OpenH264),
+        ];
+        for (spelling, encoder) in cases {
+            let line = format!("preferred_encoder = \"{spelling}\"");
+            // act
+            let read: Settings = toml::from_str(&line).unwrap();
+            let written = toml::to_string(&Settings {
+                preferred_encoder: Some(encoder),
+                ..Settings::default()
+            })
+            .unwrap();
+            // assert
+            assert_eq!(read.preferred_encoder, Some(encoder), "reading {spelling}");
+            assert!(
+                written.contains(&line),
+                "writing {spelling}, got: {written}"
+            );
+        }
     }
 
     #[test]

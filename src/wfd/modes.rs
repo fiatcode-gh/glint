@@ -24,14 +24,25 @@ pub struct VideoMode {
 }
 
 const fn p(width: u32, height: u32, fps: u32) -> VideoMode {
-    VideoMode { width, height, fps, interlaced: false }
+    VideoMode {
+        width,
+        height,
+        fps,
+        interlaced: false,
+    }
 }
 
 const fn i(width: u32, height: u32, fps: u32) -> VideoMode {
-    VideoMode { width, height, fps, interlaced: true }
+    VideoMode {
+        width,
+        height,
+        fps,
+        interlaced: true,
+    }
 }
 
 /// CEA timings, bits 0..=16 of the CEA support bitmap.
+#[rustfmt::skip]
 pub const CEA_MODES: [VideoMode; 17] = [
     p(640, 480, 60),    // 0
     p(720, 480, 60),    // 1
@@ -53,6 +64,7 @@ pub const CEA_MODES: [VideoMode; 17] = [
 ];
 
 /// VESA timings, bits 0..=28 of the VESA support bitmap.
+#[rustfmt::skip]
 pub const VESA_MODES: [VideoMode; 29] = [
     p(800, 600, 30),    // 0
     p(800, 600, 60),    // 1
@@ -86,6 +98,7 @@ pub const VESA_MODES: [VideoMode; 29] = [
 ];
 
 /// Handheld timings, bits 0..=11 of the HH support bitmap.
+#[rustfmt::skip]
 pub const HH_MODES: [VideoMode; 12] = [
     p(800, 480, 30),   // 0
     p(800, 480, 60),   // 1
@@ -117,8 +130,8 @@ mod tests {
 
     #[test]
     fn the_three_tables_have_the_lengths_the_wfd_bitmaps_imply() {
-        // The all-supported masks seen from real sinks are 0x0001ffff (CEA),
-        // 0x1fffffff (VESA) and 0x00000fff (HH) — 17, 29 and 12 bits.
+        // The all-supported masks the specification implies are 0x0001ffff
+        // (CEA), 0x1fffffff (VESA) and 0x00000fff (HH) — 17, 29 and 12 bits.
         // act & assert
         assert_eq!(CEA_MODES.len(), 17);
         assert_eq!(VESA_MODES.len(), 29);
@@ -130,21 +143,38 @@ mod tests {
         // act & assert
         assert_eq!(
             CEA_MODES[0],
-            VideoMode { width: 640, height: 480, fps: 60, interlaced: false }
+            VideoMode {
+                width: 640,
+                height: 480,
+                fps: 60,
+                interlaced: false
+            }
         );
         assert_eq!(
             CEA_MODES[8],
-            VideoMode { width: 1920, height: 1080, fps: 60, interlaced: false }
+            VideoMode {
+                width: 1920,
+                height: 1080,
+                fps: 60,
+                interlaced: false
+            }
         );
     }
 
     #[test]
     fn exactly_four_cea_modes_are_interlaced() {
-        // 720x480i60, 720x576i50, 1920x1080i60, 1920x1080i50.
+        // Bits 2, 4, 9 and 14: 720x480i60, 720x576i50, 1920x1080i60,
+        // 1920x1080i50. Pinning the bit indices rather than only the count is
+        // what catches the flag moving from one row to another.
         // act
-        let interlaced: Vec<&VideoMode> = CEA_MODES.iter().filter(|m| m.interlaced).collect();
+        let interlaced: Vec<usize> = CEA_MODES
+            .iter()
+            .enumerate()
+            .filter(|(_, mode)| mode.interlaced)
+            .map(|(bit, _)| bit)
+            .collect();
         // assert
-        assert_eq!(interlaced.len(), 4);
+        assert_eq!(interlaced, vec![2, 4, 9, 14]);
     }
 
     #[test]
@@ -177,7 +207,11 @@ mod tests {
     #[test]
     fn every_table_row_has_a_plausible_shape() {
         // A typo guard: no zero dimension, no zero frame rate.
-        for table in [CEA_MODES.as_slice(), VESA_MODES.as_slice(), HH_MODES.as_slice()] {
+        for table in [
+            CEA_MODES.as_slice(),
+            VESA_MODES.as_slice(),
+            HH_MODES.as_slice(),
+        ] {
             for mode in table {
                 // assert
                 assert!(mode.width > 0 && mode.height > 0, "{mode:?}");

@@ -1,13 +1,15 @@
 //! Round-trip tests for the four WFD parameter payloads.
 
 use glint::wfd::params::{
-    AudioCodecs, ClientRtpPorts, ContentProtection, VideoFormats, WfdParam,
+    AudioCodecs, ClientRtpPorts, ContentProtection, ParamError, VideoFormats, WfdParam,
 };
+
+/// Parse a parameter value and format it straight back out.
+type RoundTrip = fn(&str) -> String;
 
 /// A canonical `wfd_video_formats` value: one H.264 codec entry, no maximum
 /// resolution override.
-const VIDEO_ONE_CODEC: &str =
-    "40 00 02 04 0001ffff 1fffffff 00000fff 00 0000 0000 11 none none";
+const VIDEO_ONE_CODEC: &str = "40 00 02 04 0001ffff 1fffffff 00000fff 00 0000 0000 11 none none";
 
 /// Two codec entries, comma-separated, the second carrying explicit maxima.
 const VIDEO_TWO_CODECS: &str = "40 00 01 04 0001ffff 00000000 00000000 00 0000 0000 11 none none, \
@@ -23,14 +25,22 @@ const PROTECTION_HDCP: &str = "HDCP2.0 port=1189";
 #[test]
 fn canonical_strings_round_trip_exactly() {
     // arrange
-    let cases: Vec<(&str, fn(&str) -> String)> = vec![
-        (VIDEO_ONE_CODEC, |s| VideoFormats::parse(s).unwrap().format()),
-        (VIDEO_TWO_CODECS, |s| VideoFormats::parse(s).unwrap().format()),
+    let cases: Vec<(&str, RoundTrip)> = vec![
+        (VIDEO_ONE_CODEC, |s| {
+            VideoFormats::parse(s).unwrap().format()
+        }),
+        (VIDEO_TWO_CODECS, |s| {
+            VideoFormats::parse(s).unwrap().format()
+        }),
         (AUDIO_TWO, |s| AudioCodecs::parse(s).unwrap().format()),
         (AUDIO_NONE, |s| AudioCodecs::parse(s).unwrap().format()),
         (PORTS, |s| ClientRtpPorts::parse(s).unwrap().format()),
-        (PROTECTION_NONE, |s| ContentProtection::parse(s).unwrap().format()),
-        (PROTECTION_HDCP, |s| ContentProtection::parse(s).unwrap().format()),
+        (PROTECTION_NONE, |s| {
+            ContentProtection::parse(s).unwrap().format()
+        }),
+        (PROTECTION_HDCP, |s| {
+            ContentProtection::parse(s).unwrap().format()
+        }),
     ];
     for (input, round_trip) in cases {
         // act
@@ -52,7 +62,11 @@ fn non_canonical_input_is_stable_under_reparsing() {
     let twice = VideoFormats::parse(&once.format()).unwrap();
     // assert
     assert_eq!(twice, once);
-    assert_eq!(once.format(), VIDEO_ONE_CODEC, "should normalise to canonical");
+    assert_eq!(
+        once.format(),
+        VIDEO_ONE_CODEC,
+        "should normalise to canonical"
+    );
 }
 
 #[test]
@@ -127,6 +141,30 @@ fn client_rtp_ports_reads_both_ports() {
 }
 
 #[test]
+fn an_rtp_port_with_a_leading_sign_is_rejected() {
+    // `u16::from_str` accepts "+19000", and the hex fields deliberately refuse
+    // a sign, so the decimal port fields refuse one too.
+    // act
+    let result = ClientRtpPorts::parse("RTP/AVP/UDP;unicast +19000 0 mode=play");
+    // assert
+    assert!(
+        matches!(result, Err(ParamError::NotNumeric { .. })),
+        "got: {result:?}"
+    );
+}
+
+#[test]
+fn an_hdcp_port_with_a_leading_sign_is_rejected() {
+    // act
+    let result = ContentProtection::parse("HDCP2.0 port=+1189");
+    // assert
+    assert!(
+        matches!(result, Err(ParamError::NotNumeric { .. })),
+        "got: {result:?}"
+    );
+}
+
+#[test]
 fn a_malformed_video_formats_value_is_rejected() {
     // act
     let result = VideoFormats::parse("40 00 02");
@@ -137,18 +175,22 @@ fn a_malformed_video_formats_value_is_rejected() {
 #[test]
 fn a_non_hex_video_field_is_rejected() {
     // act
-    let result = VideoFormats::parse(
-        "zz 00 02 04 0001ffff 1fffffff 00000fff 00 0000 0000 11 none none",
-    );
+    let result =
+        VideoFormats::parse("zz 00 02 04 0001ffff 1fffffff 00000fff 00 0000 0000 11 none none");
     // assert
     assert!(result.is_err());
 }
 
-/// The fixture captured from a real television. The capture happens in
-/// Milestone 2, Task 24; until then there is no file to read, so this test is
-/// ignored rather than deleted — it names the gap instead of hiding it.
+/// The fixture a real television's M3 reply will supply.
+///
+/// The committed `tests/fixtures/m3_reply_video_formats.txt` is a synthetic
+/// placeholder: it holds a byte-identical copy of `VIDEO_ONE_CODEC` above, so
+/// running this test with `--ignored` passes and proves nothing at all.
+/// Milestone 2, Task 24 replaces the file with a real television's M3 reply;
+/// only from then does a green run mean anything. Until then the test stays
+/// ignored and named, so the gap is visible instead of hidden.
 #[test]
-#[ignore = "real-TV M3 reply fixture arrives with Milestone 2, Task 24"]
+#[ignore = "the committed fixture is a synthetic placeholder; the real-TV M3 reply arrives with Milestone 2, Task 24"]
 fn the_real_sink_reply_fixture_round_trips() {
     // arrange
     let fixture = include_str!("fixtures/m3_reply_video_formats.txt").trim();

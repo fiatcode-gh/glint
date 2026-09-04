@@ -1,6 +1,6 @@
 //! Capability negotiation: our formats plus the sink's, into one chosen format.
 
-use crate::wfd::modes::{modes_for_mask, CEA_MODES, HH_MODES, VESA_MODES};
+use crate::wfd::modes::{CEA_MODES, HH_MODES, VESA_MODES, modes_for_mask};
 use crate::wfd::params::{ContentProtection, VideoFormats};
 
 /// The H.264 profiles Wi-Fi Display defines, as bits of the profile field.
@@ -73,6 +73,12 @@ pub enum NegotiationError {
 /// source is progressive, so offering interlaced would be a lie — and 1080i60
 /// would otherwise tie with 1080p60 under the choice key, making the result
 /// depend on table iteration order.
+///
+/// A codec entry's `max_hres`/`max_vres` are parsed by `params.rs` and
+/// deliberately not consulted here: the choice key is exactly the one the
+/// specification defines, so a sink that sets a mode bit above its own
+/// declared maximum still gets that mode chosen — `Quirks::force_resolution`
+/// is where that class of sink is dealt with.
 pub fn negotiate(
     ours: &VideoFormats,
     sink_video_formats: &VideoFormats,
@@ -121,7 +127,7 @@ pub fn negotiate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wfd::params::{ContentProtection, H264Codec, VideoFormats};
+    use crate::wfd::params::H264Codec;
 
     /// A codec entry with the given profile and support bitmaps.
     fn codec(profile: u8, cea: u32, vesa: u32, hh: u32) -> H264Codec {
@@ -141,7 +147,11 @@ mod tests {
     }
 
     fn formats(codecs: Vec<H264Codec>) -> VideoFormats {
-        VideoFormats { native: 0x40, preferred_display_mode: 0x00, codecs }
+        VideoFormats {
+            native: 0x40,
+            preferred_display_mode: 0x00,
+            codecs,
+        }
     }
 
     const CBP: u8 = 0x01;
@@ -151,6 +161,15 @@ mod tests {
     const CEA_1080P60: u32 = 1 << 8;
     const CEA_720P60: u32 = 1 << 6;
     const CEA_1080I60: u32 = 1 << 9;
+
+    #[test]
+    fn the_derived_profile_ordering_and_rank_agree() {
+        // `key()` orders profiles by `rank()` while the enum also derives
+        // `Ord`; nothing else pins the two hand-written orders to each other.
+        // act & assert
+        assert!(H264Profile::ConstrainedBaseline < H264Profile::ConstrainedHigh);
+        assert!(H264Profile::ConstrainedBaseline.rank() < H264Profile::ConstrainedHigh.rank());
+    }
 
     #[test]
     fn the_highest_common_resolution_wins() {
@@ -275,7 +294,10 @@ mod tests {
     fn hdcp_is_refused_before_any_format_matching() {
         // arrange: a perfectly matching pair, but the sink demands HDCP
         let both = formats(vec![codec(CBP, CEA_1080P60, 0, 0)]);
-        let protection = ContentProtection::Hdcp { version: "HDCP2.0".to_string(), port: 1189 };
+        let protection = ContentProtection::Hdcp {
+            version: "HDCP2.0".to_string(),
+            port: 1189,
+        };
         // act
         let result = negotiate(&both, &both, &protection);
         // assert
@@ -289,7 +311,10 @@ mod tests {
         // arrange
         let ours = formats(vec![codec(CBP, CEA_1080P60, 0, 0)]);
         let theirs = formats(vec![codec(CBP, CEA_720P60, 0, 0)]);
-        let protection = ContentProtection::Hdcp { version: "HDCP2.1".to_string(), port: 1189 };
+        let protection = ContentProtection::Hdcp {
+            version: "HDCP2.1".to_string(),
+            port: 1189,
+        };
         // act
         let result = negotiate(&ours, &theirs, &protection);
         // assert

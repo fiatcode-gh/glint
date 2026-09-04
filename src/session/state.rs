@@ -77,7 +77,8 @@ impl Event {
 
 /// What the caller must do as a result. Only `State`'s `Display` text is
 /// pinned by tests — `Action`'s `Debug` formatting is deliberately not part of
-/// the contract (mutation control C2).
+/// the contract, so renaming an `Action` variant breaks no promise the crate
+/// makes to its callers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     StartScan,
@@ -114,9 +115,68 @@ mod tests {
     }
 
     #[test]
-    fn all_seven_states_are_covered_by_the_display_test() {
-        // A guard against a new State variant slipping past the table above.
+    fn state_all_lists_every_variant_exactly_once_in_order() {
+        // An exhaustive match: adding a State variant makes this fail to
+        // COMPILE, which is the only thing that can force a new variant to be
+        // noticed by everything that sweeps State::ALL.
+        fn index_of(state: State) -> usize {
+            match state {
+                State::Idle => 0,
+                State::Scanning => 1,
+                State::Connecting => 2,
+                State::Pairing => 3,
+                State::Negotiating => 4,
+                State::Streaming => 5,
+                State::Reconnecting => 6,
+            }
+        }
+        // The number of variants the match above enumerates.
+        const VARIANTS: usize = 7;
+
         // act & assert
-        assert_eq!(State::ALL.len(), 7);
+        assert_eq!(State::ALL.len(), VARIANTS);
+        for (index, state) in State::ALL.iter().enumerate() {
+            assert_eq!(
+                index_of(*state),
+                index,
+                "State::ALL is missing or misorders {state}"
+            );
+            assert_eq!(State::ALL[index_of(*state)], *state);
+        }
+    }
+
+    #[test]
+    fn event_all_lists_every_variant_exactly_once_in_order() {
+        // Same guard for Event: tests/state_machine.rs sweeps Event::ALL, so a
+        // variant left out of ALL would never be swept and nothing would fail.
+        fn index_of(event: Event) -> usize {
+            match event {
+                Event::ScanRequested => 0,
+                Event::ScanFinished => 1,
+                Event::ConnectRequested => 2,
+                Event::LinkUp => 3,
+                Event::PinRequired => 4,
+                Event::PinEntered => 5,
+                Event::LinkFailed => 6,
+                Event::NegotiationDone => 7,
+                Event::StreamStarted => 8,
+                Event::LinkLost => 9,
+                Event::RetryTimeout => 10,
+                Event::DisconnectRequested => 11,
+            }
+        }
+        // The number of variants the match above enumerates.
+        const VARIANTS: usize = 12;
+
+        // act & assert
+        assert_eq!(Event::ALL.len(), VARIANTS);
+        for (index, event) in Event::ALL.iter().enumerate() {
+            assert_eq!(
+                index_of(*event),
+                index,
+                "Event::ALL is missing or misorders {event:?}"
+            );
+            assert_eq!(Event::ALL[index_of(*event)], *event);
+        }
     }
 }

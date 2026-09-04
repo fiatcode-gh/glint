@@ -98,7 +98,7 @@ pub struct Resolution {
 /// A known receiver, as persisted in the receivers TOML file.
 ///
 /// Field order here is presentational only — TOML is name-keyed, so reordering
-/// these fields cannot change what round-trips (mutation control C3).
+/// these fields cannot change what round-trips.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Receiver {
     pub mac: MacAddr,
@@ -118,7 +118,10 @@ mod tests {
             mac: "aa:bb:cc:dd:ee:ff".parse().unwrap(),
             name: "Living Room TV".to_string(),
             last_mode: Some(Mode::Mirror),
-            last_resolution: Some(Resolution { width: 1920, height: 1080 }),
+            last_resolution: Some(Resolution {
+                width: 1920,
+                height: 1080,
+            }),
             restore_token: Some("tok-123".to_string()),
         }
     }
@@ -194,6 +197,32 @@ mod tests {
         let text = toml::to_string(&sample()).unwrap();
         // assert
         assert!(text.contains(r#"mac = "aa:bb:cc:dd:ee:ff""#), "got: {text}");
+    }
+
+    #[test]
+    fn the_mode_wire_spellings_are_the_receivers_file_format() {
+        // These two literals ARE the on-disk format. A round-trip test cannot
+        // catch a rename, because the serialiser and the deserialiser move
+        // together — only the spelled-out strings pin them.
+        // arrange
+        let cases = [("mirror", Mode::Mirror), ("extend", Mode::Extend)];
+        for (spelling, mode) in cases {
+            let line = format!("last_mode = \"{spelling}\"");
+            let text = format!("mac = \"aa:bb:cc:dd:ee:ff\"\nname = \"Living Room TV\"\n{line}\n");
+            // act
+            let read: Receiver = toml::from_str(&text).unwrap();
+            let written = toml::to_string(&Receiver {
+                last_mode: Some(mode),
+                ..sample()
+            })
+            .unwrap();
+            // assert
+            assert_eq!(read.last_mode, Some(mode), "reading {spelling}");
+            assert!(
+                written.contains(&line),
+                "writing {spelling}, got: {written}"
+            );
+        }
     }
 
     #[test]

@@ -11,11 +11,3 @@ pub mod receiver;
 pub mod reconnect;
 pub mod session;
 pub mod wfd;
-
-#[cfg(test)]
-mod skeleton_tests {
-    #[test]
-    fn crate_builds_and_tests_run() {
-        assert_eq!(env!("CARGO_PKG_NAME"), "glint");
-    }
-}

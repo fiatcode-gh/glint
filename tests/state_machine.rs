@@ -1,9 +1,9 @@
 //! The full transition table from the spec, pinned row by row. Anything not in
 //! the table is `InvalidTransition`.
 
-use glint::session::machine::{step, InvalidTransition};
-use glint::session::state::{Action::*, Event::*, State::*};
+use glint::session::machine::{InvalidTransition, step};
 use glint::session::state::{Action, Event, State};
+use glint::session::state::{Action::*, Event::*, State::*};
 
 /// (from, event, to, actions before the trailing EmitSignal)
 const TABLE: &[(State, Event, State, &[Action])] = &[
@@ -18,15 +18,35 @@ const TABLE: &[(State, Event, State, &[Action])] = &[
     (Pairing, LinkFailed, Idle, &[TearDownLink]),
     (Negotiating, NegotiationDone, Negotiating, &[StartPipeline]),
     (Negotiating, StreamStarted, Streaming, &[]),
-    (Negotiating, LinkLost, Reconnecting, &[StopPipeline, ScheduleRetry]),
-    (Streaming, LinkLost, Reconnecting, &[StopPipeline, ScheduleRetry]),
+    (
+        Negotiating,
+        LinkLost,
+        Reconnecting,
+        &[StopPipeline, ScheduleRetry],
+    ),
+    (
+        Streaming,
+        LinkLost,
+        Reconnecting,
+        &[StopPipeline, ScheduleRetry],
+    ),
     (Reconnecting, LinkUp, Negotiating, &[StartRtsp]),
     (Reconnecting, LinkFailed, Reconnecting, &[ScheduleRetry]),
     (Reconnecting, RetryTimeout, Idle, &[TearDownLink]),
     (Connecting, DisconnectRequested, Idle, &[TearDownLink]),
     (Pairing, DisconnectRequested, Idle, &[TearDownLink]),
-    (Negotiating, DisconnectRequested, Idle, &[StopPipeline, TearDownLink]),
-    (Streaming, DisconnectRequested, Idle, &[StopPipeline, TearDownLink]),
+    (
+        Negotiating,
+        DisconnectRequested,
+        Idle,
+        &[StopPipeline, TearDownLink],
+    ),
+    (
+        Streaming,
+        DisconnectRequested,
+        Idle,
+        &[StopPipeline, TearDownLink],
+    ),
     (Reconnecting, DisconnectRequested, Idle, &[TearDownLink]),
 ];
 
@@ -53,6 +73,18 @@ fn every_row_of_the_transition_table_holds() {
 fn the_table_covers_exactly_twenty_one_transitions() {
     // A new arm in step() that nobody added to TABLE would otherwise go unpinned.
     assert_eq!(TABLE.len(), 21);
+
+    // The sweep proves step's arms are all in TABLE, and the row test proves
+    // TABLE's rows are all in step. Set equality needs distinctness too: a
+    // duplicated (from, event) pair would let a missing one hide in the count.
+    for (index, &(from, event, _, _)) in TABLE.iter().enumerate() {
+        assert!(
+            !TABLE[..index]
+                .iter()
+                .any(|&(f, e, _, _)| f == from && e == event),
+            "{from} + {event:?} appears twice in TABLE"
+        );
+    }
 }
 
 #[test]
@@ -100,7 +132,9 @@ fn every_state_event_pair_is_either_in_the_table_or_rejected() {
             match step(state, event) {
                 Ok((next, _)) => {
                     assert!(
-                        TABLE.iter().any(|&(f, e, t, _)| f == state && e == event && t == next),
+                        TABLE
+                            .iter()
+                            .any(|&(f, e, t, _)| f == state && e == event && t == next),
                         "{state} + {event:?} succeeded but is not in TABLE"
                     );
                 }

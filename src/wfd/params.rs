@@ -14,13 +14,26 @@ use std::fmt::Write as _;
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ParamError {
     #[error("expected {expected} fields in {context}, found {found}")]
-    FieldCount { context: &'static str, expected: usize, found: usize },
+    FieldCount {
+        context: &'static str,
+        expected: usize,
+        found: usize,
+    },
     #[error("field {field:?} in {context} is not valid hexadecimal")]
-    NotHex { context: &'static str, field: String },
+    NotHex {
+        context: &'static str,
+        field: String,
+    },
     #[error("field {field:?} in {context} is not a valid number")]
-    NotNumeric { context: &'static str, field: String },
+    NotNumeric {
+        context: &'static str,
+        field: String,
+    },
     #[error("{context} has an unexpected shape: {value:?}")]
-    Shape { context: &'static str, value: String },
+    Shape {
+        context: &'static str,
+        value: String,
+    },
 }
 
 /// Parse and format a WFD parameter value.
@@ -31,11 +44,19 @@ pub trait WfdParam: Sized {
 
 fn hex<T: TryFrom<u64>>(context: &'static str, field: &str) -> Result<T, ParamError> {
     if field.is_empty() || !field.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(ParamError::NotHex { context, field: field.to_string() });
+        return Err(ParamError::NotHex {
+            context,
+            field: field.to_string(),
+        });
     }
-    let raw = u64::from_str_radix(field, 16)
-        .map_err(|_| ParamError::NotHex { context, field: field.to_string() })?;
-    T::try_from(raw).map_err(|_| ParamError::NotHex { context, field: field.to_string() })
+    let raw = u64::from_str_radix(field, 16).map_err(|_| ParamError::NotHex {
+        context,
+        field: field.to_string(),
+    })?;
+    T::try_from(raw).map_err(|_| ParamError::NotHex {
+        context,
+        field: field.to_string(),
+    })
 }
 
 /// `none` (case-insensitive) or a hex value.
@@ -124,10 +145,10 @@ pub struct VideoFormats {
 impl WfdParam for VideoFormats {
     fn parse(value: &str) -> Result<Self, ParamError> {
         const CTX: &str = "wfd_video_formats";
+        // `str::split` always yields at least one item, even for the empty
+        // string, so the first entry has no missing case to handle.
         let mut entries = value.split(',').map(str::trim);
-        let first = entries
-            .next()
-            .ok_or_else(|| ParamError::Shape { context: CTX, value: value.to_string() })?;
+        let first = entries.next().expect("split always yields one entry");
 
         let first_fields: Vec<&str> = first.split_whitespace().collect();
         if first_fields.len() != CODEC_FIELDS + 2 {
@@ -146,12 +167,20 @@ impl WfdParam for VideoFormats {
             codecs.push(H264Codec::parse_fields(&fields)?);
         }
 
-        Ok(VideoFormats { native, preferred_display_mode, codecs })
+        Ok(VideoFormats {
+            native,
+            preferred_display_mode,
+            codecs,
+        })
     }
 
     fn format(&self) -> String {
         let mut out = String::new();
-        let _ = write!(out, "{:02x} {:02x} ", self.native, self.preferred_display_mode);
+        let _ = write!(
+            out,
+            "{:02x} {:02x} ",
+            self.native, self.preferred_display_mode
+        );
         for (index, codec) in self.codecs.iter().enumerate() {
             if index > 0 {
                 out.push_str(", ");
@@ -186,7 +215,11 @@ impl WfdParam for AudioCodecs {
         for entry in value.split(',').map(str::trim) {
             let fields: Vec<&str> = entry.split_whitespace().collect();
             if fields.len() != 3 {
-                return Err(ParamError::FieldCount { context: CTX, expected: 3, found: fields.len() });
+                return Err(ParamError::FieldCount {
+                    context: CTX,
+                    expected: 3,
+                    found: fields.len(),
+                });
             }
             codecs.push(AudioCodec {
                 format: fields[0].to_string(),
@@ -226,15 +259,33 @@ impl WfdParam for ClientRtpPorts {
         const CTX: &str = "wfd_client_rtp_ports";
         let fields: Vec<&str> = value.split_whitespace().collect();
         if fields.len() != 4 {
-            return Err(ParamError::FieldCount { context: CTX, expected: 4, found: fields.len() });
+            return Err(ParamError::FieldCount {
+                context: CTX,
+                expected: 4,
+                found: fields.len(),
+            });
         }
+        // `u16::from_str` accepts a leading '+', and the hex path deliberately
+        // rejects a sign, so the decimal path checks the digits itself rather
+        // than trusting the parse to refuse "+19000".
         let port = |f: &str| {
-            f.parse::<u16>()
-                .map_err(|_| ParamError::NotNumeric { context: CTX, field: f.to_string() })
+            if f.is_empty() || !f.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(ParamError::NotNumeric {
+                    context: CTX,
+                    field: f.to_string(),
+                });
+            }
+            f.parse::<u16>().map_err(|_| ParamError::NotNumeric {
+                context: CTX,
+                field: f.to_string(),
+            })
         };
         let mode = fields[3]
             .strip_prefix("mode=")
-            .ok_or_else(|| ParamError::Shape { context: CTX, value: fields[3].to_string() })?;
+            .ok_or_else(|| ParamError::Shape {
+                context: CTX,
+                value: fields[3].to_string(),
+            })?;
         Ok(ClientRtpPorts {
             profile: fields[0].to_string(),
             rtp_port0: port(fields[1])?,
@@ -244,7 +295,10 @@ impl WfdParam for ClientRtpPorts {
     }
 
     fn format(&self) -> String {
-        format!("{} {} {} mode={}", self.profile, self.rtp_port0, self.rtp_port1, self.mode)
+        format!(
+            "{} {} {} mode={}",
+            self.profile, self.rtp_port0, self.rtp_port1, self.mode
+        )
     }
 }
 
@@ -255,7 +309,10 @@ pub enum ContentProtection {
     None,
     /// HDCP cannot be supported on Linux (design spec section 6). Parsing it
     /// is how the daemon produces a clear refusal instead of a silent failure.
-    Hdcp { version: String, port: u16 },
+    Hdcp {
+        version: String,
+        port: u16,
+    },
 }
 
 impl ContentProtection {
@@ -273,14 +330,31 @@ impl WfdParam for ContentProtection {
         }
         let fields: Vec<&str> = trimmed.split_whitespace().collect();
         if fields.len() != 2 {
-            return Err(ParamError::FieldCount { context: CTX, expected: 2, found: fields.len() });
+            return Err(ParamError::FieldCount {
+                context: CTX,
+                expected: 2,
+                found: fields.len(),
+            });
         }
-        let port = fields[1]
+        let digits = fields[1]
             .strip_prefix("port=")
-            .ok_or_else(|| ParamError::Shape { context: CTX, value: fields[1].to_string() })?
-            .parse::<u16>()
-            .map_err(|_| ParamError::NotNumeric { context: CTX, field: fields[1].to_string() })?;
-        Ok(ContentProtection::Hdcp { version: fields[0].to_string(), port })
+            .ok_or_else(|| ParamError::Shape {
+                context: CTX,
+                value: fields[1].to_string(),
+            })?;
+        let not_numeric = || ParamError::NotNumeric {
+            context: CTX,
+            field: fields[1].to_string(),
+        };
+        // Same reason as the RTP ports: `u16::from_str` would accept "+1189".
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(not_numeric());
+        }
+        let port = digits.parse::<u16>().map_err(|_| not_numeric())?;
+        Ok(ContentProtection::Hdcp {
+            version: fields[0].to_string(),
+            port,
+        })
     }
 
     fn format(&self) -> String {

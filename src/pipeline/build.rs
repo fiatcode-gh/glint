@@ -3,23 +3,30 @@
 //! The string deliberately ends at `rtpmp2tpay`: the UDP destination is the
 //! sink's, and it arrives in `wfd_client_rtp_ports` over RTSP in Milestone 2.
 //! The RTSP layer appends the sink once it knows where to send.
+//!
+//! # Provenance of the encoder properties
+//!
+//! It is not uniform, so it is written down rather than assumed:
+//!
+//! - `vah264enc` and `x264enc` were MEASURED with `gst-inspect-1.0` on the
+//!   development host on 2026-09-04 — see `docs/research/vaapi-encoder.md`.
+//!   Both take `bitrate` in kbps.
+//! - `openh264enc` is DOC-SOURCED and unverified: the plugin is not installed
+//!   here. Its properties come from the official GStreamer documentation,
+//!   <https://gstreamer.freedesktop.org/documentation/openh264/openh264enc.html>.
+//!   Its `bitrate` is in **bits per second**, not kbps (decision D12) — hence
+//!   `bitrate_scale`. Constrained Baseline has no B-frames, so it exposes no
+//!   B-frame property at all.
+//!
+//! No string this module emits has ever been run through a live GStreamer
+//! pipeline. The snapshot tests pin the text; only Milestone 3 can pin that
+//! the text actually plays.
 
 use crate::pipeline::{Encoder, PipelineSpec};
 
 /// Every encoder-specific name in one place, so no property spelling is
-/// scattered through the builder.
-///
-/// Provenance, and it is not uniform:
-///
-/// - `vah264enc` and `x264enc` were MEASURED with `gst-inspect-1.0` on the
-///   development host on 2026-09-04 — see `docs/research/vaapi-encoder.md`.
-///   Both take `bitrate` in kbps.
-/// - `openh264enc` is DOC-SOURCED and unverified: the plugin is not installed
-///   here. Its properties come from the official GStreamer documentation,
-///   <https://gstreamer.freedesktop.org/documentation/openh264/openh264enc.html>.
-///   Its `bitrate` is in **bits per second**, not kbps (decision D12) — hence
-///   `bitrate_scale`. Constrained Baseline has no B-frames, so it exposes no
-///   B-frame property at all.
+/// scattered through the builder. Where each spelling came from — and which of
+/// them are measured rather than doc-sourced — is in the module header.
 struct EncoderProps {
     element: &'static str,
     /// The constant-bitrate switch, spelled differently by each element.
@@ -96,7 +103,9 @@ video/x-raw,width={width},height={height},framerate={fps}/1 ! \
     if spec.audio {
         // LPCM 48 kHz 16-bit stereo is the Wi-Fi Display mandatory audio
         // codec, so every sink accepts it and the branch needs no encoder
-        // element. S16BE is the byte order MPEG-TS carries LPCM in.
+        // element. S16BE is the byte order MPEG-TS carries LPCM in — and, like
+        // the rest of this string, that is doc-sourced and has never been run
+        // through a live pipeline.
         pipeline.push_str(&format!(
             " pipewiresrc path={} ! audioconvert ! audioresample ! \
 audio/x-raw,format=S16BE,rate=48000,channels=2 ! mux.",
@@ -110,7 +119,6 @@ audio/x-raw,format=S16BE,rate=48000,channels=2 ! mux.",
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::{Encoder, PipelineSpec};
 
     fn spec(encoder: Encoder, audio: bool) -> PipelineSpec {
         PipelineSpec {
@@ -127,8 +135,7 @@ mod tests {
 
     const VIDEO_HEAD: &str = "pipewiresrc path=42 ! videoconvert ! videoscale ! \
 video/x-raw,width=1920,height=1080,framerate=60/1 ! ";
-    const VIDEO_TAIL: &str =
-        " ! h264parse config-interval=-1 ! mpegtsmux name=mux ! rtpmp2tpay";
+    const VIDEO_TAIL: &str = " ! h264parse config-interval=-1 ! mpegtsmux name=mux ! rtpmp2tpay";
     const AUDIO_BRANCH: &str = " pipewiresrc path=43 ! audioconvert ! audioresample ! \
 audio/x-raw,format=S16BE,rate=48000,channels=2 ! mux.";
 
@@ -233,9 +240,12 @@ gop-size=120{VIDEO_TAIL}{AUDIO_BRANCH}"
 
     #[test]
     fn the_two_measured_encoders_take_the_bitrate_in_kbps_unscaled() {
+        // The trailing space matters: "bitrate=20000" is also a substring of
+        // "bitrate=20000000", so without it a wrongly scaled measured encoder
+        // would pass this test.
         // act & assert
-        assert!(build(&spec(Encoder::VaH264, false)).contains("bitrate=20000"));
-        assert!(build(&spec(Encoder::X264, false)).contains("bitrate=20000"));
+        assert!(build(&spec(Encoder::VaH264, false)).contains("bitrate=20000 "));
+        assert!(build(&spec(Encoder::X264, false)).contains("bitrate=20000 "));
     }
 
     #[test]

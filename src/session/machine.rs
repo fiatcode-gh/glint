@@ -26,9 +26,9 @@ impl std::error::Error for InvalidTransition {}
 
 /// Appends the signal every valid transition ends with.
 ///
-/// Private, and named for what it does rather than where it is called from —
-/// the tests pin behaviour, so renaming this changes nothing (mutation
-/// control C1).
+/// Private, and named for what it does rather than where it is called from.
+/// The tests pin `step`'s observable behaviour, never this helper's name, so
+/// renaming it changes nothing a caller can see.
 fn with_signal(next: State, mut actions: Vec<Action>) -> (State, Vec<Action>) {
     actions.push(Action::EmitSignal(next));
     (next, actions)

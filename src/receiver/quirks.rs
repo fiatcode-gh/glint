@@ -27,7 +27,10 @@ const QUIRKS_TABLE: &[QuirkEntry] = &[QuirkEntry {
     // Fictional. Real vendors arrive as real bugs are found.
     device_info_contains: "glinttest reference sink",
     quirks: Quirks {
-        force_resolution: Some(Resolution { width: 1280, height: 720 }),
+        force_resolution: Some(Resolution {
+            width: 1280,
+            height: 720,
+        }),
         ignore_audio: true,
         extra_rtsp_delay_ms: 250,
     },
@@ -72,7 +75,10 @@ mod tests {
         // assert
         assert_eq!(
             quirks.force_resolution,
-            Some(Resolution { width: 1280, height: 720 })
+            Some(Resolution {
+                width: 1280,
+                height: 720
+            })
         );
         assert!(quirks.ignore_audio);
         assert_eq!(quirks.extra_rtsp_delay_ms, 250);
@@ -86,6 +92,22 @@ mod tests {
         let quirks = quirks_for("acme glinttest reference sink v1 (build 42)");
         // assert
         assert!(quirks.ignore_audio);
+    }
+
+    #[test]
+    fn every_table_needle_is_lowercase() {
+        // `quirks_for` lowercases the haystack but not the needle, so a row
+        // written `device_info_contains: "Samsung TV"` would compile, read
+        // correctly, and never match anything.
+        for entry in QUIRKS_TABLE {
+            // act & assert
+            assert_eq!(
+                entry.device_info_contains,
+                entry.device_info_contains.to_ascii_lowercase(),
+                "needle {:?} must be lowercase",
+                entry.device_info_contains
+            );
+        }
     }
 
     #[test]
