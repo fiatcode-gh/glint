@@ -2,4 +2,5 @@
 //! capability negotiation over them.
 
 pub mod modes;
+pub mod negotiate;
 pub mod params;
