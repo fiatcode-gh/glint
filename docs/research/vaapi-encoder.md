@@ -62,8 +62,8 @@ string builder) in the implementation plan.
 
 | Need | `vah264enc` (hardware, measured) | `x264enc` (software, measured) | `openh264enc` (not installed — unverified) |
 |---|---|---|---|
-| Constant bitrate | `rate-control=cbr` (enum; cbr is the default; also vbr, cqp, qvbr) | `pass=cbr` (enum; cbr is the default) | `rate-control` per upstream docs |
-| Bitrate | `bitrate` in kbps (0 = auto) | `bitrate` in kbit/sec | `bitrate` per upstream docs |
+| Constant bitrate | `rate-control=cbr` (enum; cbr is the default; also vbr, cqp, qvbr) | `pass=cbr` (enum; cbr is the default) | `rate-control=bitrate` (Rc_modes 1) per upstream docs |
+| Bitrate | `bitrate` in kbps (0 = auto) | `bitrate` in kbit/sec | `bitrate` in **bits per second** per upstream docs — a ×1000 scale versus the other two; unscaled it streams at 1/1000th the intended rate |
 | Zero B-frames | `b-frames` (uint 0–31, default 0) | `bframes` (uint 0–16, default 0) | none needed — Constrained Baseline has no B-frames |
 | Keyframe interval | `key-int-max` in frames (uint 0–1024, 0 = auto) | `key-int-max` in frames (0 = auto) | `gop-size` per upstream docs |
 
