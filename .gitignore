@@ -1,0 +1,14 @@
+# Rust
+/target
+
+# Local-only planning artifacts (never committed)
+docs/plans/
+docs/reports/
+
+# LDD epic ledgers (local mode, one directory per epic)
+docs/foundation/
+docs/stream/
+docs/dbus/
+docs/reliability/
+docs/cli/
+docs/flutter/
