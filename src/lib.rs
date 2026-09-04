@@ -10,6 +10,7 @@ pub mod pipeline;
 pub mod receiver;
 pub mod reconnect;
 pub mod session;
+pub mod wfd;
 
 #[cfg(test)]
 mod skeleton_tests {
