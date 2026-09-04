@@ -51,11 +51,11 @@ Reason: desktop independence and Extend mode are structural. Reconnect logic liv
 | Concern | Decision | Reason |
 |---|---|---|
 | Link layer | NetworkManager Wi-Fi P2P device API (`NMDeviceWifiP2P`, NetworkManager 1.16+). The P2P connection must advertise WFD information elements (`wifi-p2p.wfd-ies`) so sinks recognize us as a Miracast source, not a plain Wi-Fi Direct peer | Same path GND uses; works on Fedora and most distros without extra setup. No direct wpa_supplicant control. |
-| Protocol | Wi-Fi Display (WFD) as specified. Source runs an RTSP server on TCP 7236; receiver connects; MPEG-TS over RTP/UDP | Standard behavior. `gst-rtsp-server` handles RTSP. |
+| Protocol | Wi-Fi Display (WFD) as specified. Source runs an RTSP listener on TCP 7236; receiver connects; MPEG-TS over RTP/UDP | Standard behavior. The RTSP control channel is hand-rolled (plain TCP listener plus the `rtsp-types` crate): WFD reverses the RTSP roles, and the `gst-rtsp-server` Rust bindings lack the hooks needed to bend it (see `docs/research/rtsp-approach.md`). The media pipeline stays in GStreamer either way. |
 | Screen capture | xdg-desktop-portal ScreenCast interface, yielding a PipeWire stream | One code path for KDE, GNOME, and wlroots compositors. |
 | Audio capture | PipeWire monitor of the default sink | Consistent with video capture; same clock domain available. |
-| Encode | GStreamer pipeline: PipeWire source, H.264 encoder, MPEG-TS mux with audio, RTP payload, UDP sink | Hardware encode via VA-API first (Radeon 780M supports it), x264 software fallback. Encoder chosen at runtime. |
-| Extend mode | `VirtualOutput` trait with per-compositor implementations | Mutter backend uses the virtual-monitor path gnome-remote-desktop uses. KWin backend: **needs research**. wlroots: unfilled slot. |
+| Encode | GStreamer pipeline: PipeWire source, H.264 encoder, MPEG-TS mux with audio, RTP payload, UDP sink | Encoder chosen at runtime down a fallback chain: `vah264enc` (hardware VA-API), `x264enc`, `openh264enc`; a clear error names the packages to install when none is present. The app never ships an encoder, so distributions without H.264 (stock Fedora, openSUSE) still work after one package install — or via a future Flatpak, whose runtime carries the codecs. |
+| Extend mode | xdg-desktop-portal ScreenCast with source type VIRTUAL (bit 4); runtime probe of `AvailableSourceTypes` greys out Extend when the bit is absent | One cross-desktop code path, researched 2026-09-04: works on KDE (Plasma 5.25+, live-verified on 6.7.4) and GNOME (42+). Compositor-specific fallbacks exist if resolution control is ever needed (KWin `zkde_screencast_unstable_v1`, Mutter `RecordVirtual`) — see `docs/research/kwin-virtual-output.md` and `docs/research/mutter-virtual-output.md`. wlroots: unverified. |
 | Control surface | One D-Bus service on the session bus. Objects: daemon, each discovered receiver, active session. Signals on every state change | Clients never poll. Any D-Bus-capable tool can drive it. |
 | Daemon language | Rust, using `gstreamer-rs` and `zbus` | Memory safety in a long-running network daemon, first-class GStreamer bindings, D-Bus without GLib. |
 | First client | Flutter desktop, talking D-Bus | Matches author's stack. Qt/Kirigami later if KDE integration demands it. |
@@ -124,10 +124,10 @@ Dart is not used in the daemon because it has no usable GStreamer bindings.
 
 ## 8. Open research items (resolve before implementation planning is final)
 
-1. Does the development laptop's Wi-Fi chip support P2P-client and P2P-GO modes?
-2. What, if anything, does KWin expose for creating a virtual output that an external process can drive?
-3. Exact Mutter D-Bus calls used by gnome-remote-desktop for virtual monitors, and their stability across GNOME versions.
-4. Which VA-API H.264 low-latency parameters the Radeon 780M driver honors.
-5. RTSP approach. Wi-Fi Display reverses the usual RTSP roles: the sink opens the TCP connection, then the source sends M1/M3/M4/M5 requests back over that same connection. Stock `gst-rtsp-server` does not do this; GNOME Network Displays subclasses it heavily to make it work. Decide between subclassing through the Rust bindings and hand-rolling the small, fixed WFD message flow. Decision rule: hand-roll if the spike confirms it is simpler.
+1. ~~Does the development laptop's Wi-Fi chip support P2P-client and P2P-GO modes?~~ **Yes** (verified 2026-09-04: `P2P-client` and `P2P-GO` in `iw list`, NetworkManager 1.56.1).
+2. ~~What, if anything, does KWin expose for creating a virtual output that an external process can drive?~~ **Answered** — portal ScreenCast VIRTUAL type, plus KWin's gated `zkde_screencast_unstable_v1`; see `docs/research/kwin-virtual-output.md`.
+3. ~~Exact Mutter D-Bus calls used by gnome-remote-desktop for virtual monitors, and their stability across GNOME versions.~~ **Answered** — `RecordVirtual` on `org.gnome.Mutter.ScreenCast.Session`; private API, so the portal VIRTUAL type is the recommended route; see `docs/research/mutter-virtual-output.md`.
+4. Which VA-API H.264 low-latency parameters the Radeon 780M driver honors — **pending a codec install**; the encoder landscape and fallback chain are documented in `docs/research/vaapi-encoder.md`.
+5. ~~RTSP approach.~~ **Decided: hand-roll.** The gst-rtsp-server Rust bindings lack the hooks Wi-Fi Display needs (no `send_message` vfunc, no session-pool subclassing); glint uses a plain TCP listener on 7236 with the `rtsp-types` crate; see `docs/research/rtsp-approach.md`.
 
 #miracast #linux #rust #flutter #design-spec
