@@ -8,6 +8,7 @@
 pub mod config;
 pub mod pipeline;
 pub mod receiver;
+pub mod reconnect;
 pub mod session;
 
 #[cfg(test)]
