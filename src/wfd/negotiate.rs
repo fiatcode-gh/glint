@@ -239,6 +239,17 @@ mod tests {
     }
 
     #[test]
+    fn a_handheld_mode_wins_when_it_is_the_only_overlap() {
+        // arrange: HH bit 9 is 960x540p60, and it is the only bit both sides share
+        let ours = formats(vec![codec(CBP, 0, 0, 1 << 9)]);
+        let theirs = formats(vec![codec(CBP, 0, 0, 1 << 9)]);
+        // act
+        let chosen = negotiate(&ours, &theirs, &ContentProtection::None).unwrap();
+        // assert
+        assert_eq!((chosen.width, chosen.height, chosen.fps), (960, 540, 60));
+    }
+
+    #[test]
     fn no_overlap_at_all_is_no_common_format() {
         // arrange
         let ours = formats(vec![codec(CBP, CEA_1080P60, 0, 0)]);
