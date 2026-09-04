@@ -1,7 +1,9 @@
 # R4: VA-API H.264 encoder on the Radeon 780M
 
-Status: **codec install approved, pending** — property measurements resume after
-the install. Checked 2026-09-04, Fedora Kinoite 44, GStreamer 1.28.6.
+Status: **done** — `mesa-va-drivers-freeworld` and `gstreamer1-plugins-ugly`
+installed 2026-09-04; `vah264enc` and `x264enc` measured below. `openh264enc`
+was not installed (its properties stay unverified). Fedora Kinoite 44,
+GStreamer 1.28.6, Radeon 780M.
 
 ## Findings
 
@@ -53,15 +55,30 @@ runtime, so packaging is unaffected by the patent issue:
   `org.freedesktop.Platform.openh264` extension installs automatically, and
   bundling x264 is permitted on Flathub (OBS Studio does).
 
-## Still to measure (after the codec install)
+## Measured encoder properties (2026-09-04, after the install)
 
-Run `gst-inspect-1.0` on `vah264enc`, `x264enc`, and `openh264enc` and record
-here which of these properties each exposes, with their exact names:
+From `gst-inspect-1.0` on this machine. These names feed Task 10 (pipeline
+string builder) in the implementation plan.
 
-- rate control mode (constant bitrate)
-- B-frame count (must be forceable to zero)
-- keyframe / IDR interval
+| Need | `vah264enc` (hardware, measured) | `x264enc` (software, measured) | `openh264enc` (not installed — unverified) |
+|---|---|---|---|
+| Constant bitrate | `rate-control=cbr` (enum; cbr is the default; also vbr, cqp, qvbr) | `pass=cbr` (enum; cbr is the default) | `rate-control` per upstream docs |
+| Bitrate | `bitrate` in kbps (0 = auto) | `bitrate` in kbit/sec | `bitrate` per upstream docs |
+| Zero B-frames | `b-frames` (uint 0–31, default 0) | `bframes` (uint 0–16, default 0) | none needed — Constrained Baseline has no B-frames |
+| Keyframe interval | `key-int-max` in frames (uint 0–1024, 0 = auto) | `key-int-max` in frames (0 = auto) | `gop-size` per upstream docs |
 
-These names feed Task 10 (pipeline string builder) in the implementation plan.
+Extra low-latency knobs worth using:
+
+- `x264enc`: `tune=zerolatency` (flag 0x4, verified present) and
+  `speed-preset` (default `medium`).
+- `vah264enc`: `target-usage` (1–7 speed/quality balance, default 4),
+  `cpb-size` (kb), `ref-frames`.
+
+Profiles: `vah264enc` on the 780M offers `constrained-baseline`, `main`, and
+`high` on its source pad — Constrained Baseline is the Wi-Fi Display mandatory
+profile, so hardware encode covers the strictest sink.
+
+A two-second keyframe interval is therefore `key-int-max = 2 * fps` on both
+measured encoders.
 
 #miracast #research
