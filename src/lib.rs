@@ -5,6 +5,8 @@
 //! snapshot, not by constructing GStreamer elements, so the whole crate builds
 //! and tests on a machine with no GStreamer, no display and no network.
 
+pub mod receiver;
+
 #[cfg(test)]
 mod skeleton_tests {
     #[test]
