@@ -58,6 +58,23 @@ pub enum Event {
     DisconnectRequested,
 }
 
+impl Event {
+    pub const ALL: [Event; 12] = [
+        Event::ScanRequested,
+        Event::ScanFinished,
+        Event::ConnectRequested,
+        Event::LinkUp,
+        Event::PinRequired,
+        Event::PinEntered,
+        Event::LinkFailed,
+        Event::NegotiationDone,
+        Event::StreamStarted,
+        Event::LinkLost,
+        Event::RetryTimeout,
+        Event::DisconnectRequested,
+    ];
+}
+
 /// What the caller must do as a result. Only `State`'s `Display` text is
 /// pinned by tests — `Action`'s `Debug` formatting is deliberately not part of
 /// the contract (mutation control C2).
