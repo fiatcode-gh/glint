@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.92"
 
 [dependencies]
+ashpd = { version = "0.13", features = ["screencast"] }
 oo7 = "0.6"
 serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2.0.20"

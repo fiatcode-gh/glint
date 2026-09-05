@@ -1,10 +1,12 @@
 //! glint — pure-logic core of the Miracast sender daemon.
 //!
-//! This crate deliberately has **no GStreamer dependency**. The pipeline
-//! builder emits a `gst-launch`-style description string and is tested by
-//! snapshot, not by constructing GStreamer elements, so the whole crate builds
-//! and tests on a machine with no GStreamer, no display and no network.
+//! The pipeline builder emits a `gst-launch`-style description string and is
+//! tested by snapshot rather than by constructing GStreamer elements, so the
+//! shape of a cast is settled without a display, a network, or a portal. Only
+//! `pipeline::runner` and `pipeline::encoder` reach a live GStreamer, and only
+//! `capture::portal` reaches a live desktop.
 
+pub mod capture;
 pub mod config;
 pub mod link;
 pub mod pipeline;
