@@ -5,14 +5,11 @@ edition = "2024"
 rust-version = "1.92"
 
 [dependencies]
+oo7 = "0.6"
 serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2.0.20"
+toml = "1.1.5"
 tracing = "0.1.44"
 
-# `toml` is a DEV-dependency on purpose. Nothing in this unit reads or writes a
-# file — TOML is exercised only by the serde round-trip tests. It becomes a
-# regular dependency when src/config/store.rs lands in Milestone 3 and actually
-# touches the disk. Keeping it out of [dependencies] keeps the release build
-# honest about what the pure-logic core needs.
 [dev-dependencies]
-toml = "1.1.5"
+tokio = { version = "1", features = ["rt", "macros"] }

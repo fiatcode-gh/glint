@@ -1,6 +1,7 @@
 //! The receiver (sink) a cast targets, and its persisted form.
 
 pub mod quirks;
+pub mod registry;
 
 use std::fmt;
 use std::str::FromStr;

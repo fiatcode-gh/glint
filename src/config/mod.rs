@@ -1,5 +1,7 @@
 //! User settings, as persisted in the settings TOML file.
 
+pub mod store;
+
 use serde::{Deserialize, Serialize};
 
 use crate::pipeline::Encoder;
