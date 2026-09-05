@@ -221,19 +221,22 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn saving_leaves_no_temp_file_behind() {
+    fn a_finished_save_leaves_only_the_settings_file_in_the_directory() {
+        // Listing the whole directory rather than filtering for a suffix: a
+        // test that looks for ".tmp" stops seeing the scratch file the moment
+        // the suffix is renamed.
         // arrange
         let dir = TempDir::new("settings-no-temp");
         let store = ConfigStore::new(dir.path());
         // act
         store.save_settings(&Settings::default()).unwrap();
         // assert
-        let leftovers: Vec<_> = fs::read_dir(dir.path())
+        let mut left: Vec<String> = fs::read_dir(dir.path())
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .filter(|name| name.ends_with(".tmp"))
             .collect();
-        assert!(leftovers.is_empty(), "got: {leftovers:?}");
+        left.sort();
+        assert_eq!(left, ["settings.toml"]);
     }
 
     #[test]
