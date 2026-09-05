@@ -124,7 +124,7 @@ fn write_atomically(path: &Path, contents: &str) -> std::io::Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::pipeline::Encoder;
 

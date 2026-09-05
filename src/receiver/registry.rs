@@ -3,6 +3,9 @@
 use serde::{Deserialize, Serialize};
 
 use super::{MacAddr, Receiver};
+use crate::config::store::{ConfigStore, StoreError};
+
+const RECEIVERS_FILE: &str = "receivers.toml";
 
 /// The field name is the wire format: it is what makes the file an array of
 /// `[[receivers]]` tables.
@@ -46,6 +49,14 @@ impl Registry {
         let before = self.receivers.len();
         self.receivers.retain(|r| r.mac != mac);
         self.receivers.len() != before
+    }
+
+    pub fn load(store: &ConfigStore) -> Result<Self, StoreError> {
+        store.load_toml(RECEIVERS_FILE)
+    }
+
+    pub fn save(&self, store: &ConfigStore) -> Result<(), StoreError> {
+        store.save_toml(RECEIVERS_FILE, self)
     }
 }
 
@@ -182,5 +193,78 @@ mod tests {
         let text = toml::to_string(&registry).unwrap();
         // assert
         assert!(text.contains("[[receivers]]"), "got: {text}");
+    }
+
+    fn temp_store(tag: &str) -> (crate::config::store::tests::TempDir, ConfigStore) {
+        let dir = crate::config::store::tests::TempDir::new(tag);
+        let store = ConfigStore::new(dir.path());
+        (dir, store)
+    }
+
+    #[test]
+    fn loading_from_a_directory_without_a_receivers_file_yields_an_empty_registry() {
+        // arrange
+        let (_dir, store) = temp_store("registry-first-run");
+        // act
+        let registry = Registry::load(&store).unwrap();
+        // assert
+        assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn the_registry_round_trips_through_the_store_preserving_order() {
+        // arrange
+        let (_dir, store) = temp_store("registry-round-trip");
+        let mut registry = Registry::new();
+        registry.upsert(sample("00:00:00:00:00:01", "First"));
+        registry.upsert(sample("00:00:00:00:00:02", "Second"));
+        // act
+        registry.save(&store).unwrap();
+        let loaded = Registry::load(&store).unwrap();
+        // assert
+        assert_eq!(loaded, registry);
+        let names: Vec<&str> = loaded.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["First", "Second"]);
+    }
+
+    #[test]
+    fn a_corrupt_receivers_file_is_a_parse_error_and_not_a_panic() {
+        // arrange
+        let (dir, store) = temp_store("registry-corrupt");
+        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::write(dir.path().join("receivers.toml"), "[[receivers]\nmac =").unwrap();
+        // act
+        let err = Registry::load(&store).unwrap_err();
+        // assert
+        assert!(matches!(err, StoreError::Parse { .. }), "got: {err:?}");
+    }
+
+    #[test]
+    fn a_corrupt_receivers_file_does_not_stop_settings_from_loading() {
+        // The two files fail independently: a machine-written registry that
+        // got truncated must not take the user's settings down with it.
+        // arrange
+        let (dir, store) = temp_store("registry-corrupt-isolated");
+        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::write(dir.path().join("settings.toml"), "retry_timeout_secs = 90").unwrap();
+        std::fs::write(dir.path().join("receivers.toml"), "[[receivers]\nmac =").unwrap();
+        // act
+        let settings = store.load_settings().unwrap();
+        let registry = Registry::load(&store);
+        // assert
+        assert_eq!(settings.retry_timeout_secs, 90);
+        assert!(matches!(registry, Err(StoreError::Parse { .. })));
+    }
+
+    #[test]
+    fn saving_the_registry_creates_the_directory_when_it_is_missing() {
+        // arrange
+        let (dir, store) = temp_store("registry-mkdir");
+        let mut registry = Registry::new();
+        registry.upsert(sample("aa:bb:cc:dd:ee:ff", "Living Room TV"));
+        // act
+        registry.save(&store).unwrap();
+        // assert
+        assert!(dir.path().join("receivers.toml").is_file());
     }
 }
