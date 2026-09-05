@@ -1,6 +1,7 @@
 //! Storage for the pairing secret of each receiver.
 
 pub mod memory;
+pub mod secret_service;
 
 use crate::receiver::MacAddr;
 
