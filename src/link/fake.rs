@@ -21,7 +21,6 @@ pub struct FakeP2pLink {
     connect_results: Mutex<VecDeque<Result<LinkHandle, LinkError>>>,
     stale_groups: Mutex<Vec<GroupId>>,
     calls: Mutex<Vec<LinkCall>>,
-    next_handle: Mutex<u64>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -63,16 +62,14 @@ impl P2pLink for FakeP2pLink {
         Ok(self.peers.clone())
     }
 
-    /// An exhausted script means "connecting works": most tests care about
-    /// what happens after a connection, not about the connection itself.
+    /// Running off the end of the script is an error, not a fresh handle: a
+    /// silently minted one would let an implementation that connects twice
+    /// pass a test that scripted a single connection.
     async fn connect(&self, peer: &Peer) -> Result<LinkHandle, LinkError> {
         self.record(LinkCall::Connect(peer.clone()));
-        if let Some(scripted) = lock(&self.connect_results).pop_front() {
-            return scripted;
-        }
-        let mut next = lock(&self.next_handle);
-        *next += 1;
-        Ok(LinkHandle::new(*next))
+        lock(&self.connect_results)
+            .pop_front()
+            .unwrap_or_else(|| Err(LinkError::Backend("connect script exhausted".to_string())))
     }
 
     async fn disconnect(&self, handle: LinkHandle) -> Result<(), LinkError> {
@@ -133,9 +130,9 @@ mod tests {
     #[tokio::test]
     async fn connect_hands_out_a_handle_that_disconnect_accepts() {
         // The handle's value is deliberately not asserted: `LinkHandle` is
-        // opaque, so what it carries is the fake's business.
+        // opaque, so what it carries is the script's business.
         // arrange
-        let link = FakeP2pLink::new();
+        let link = FakeP2pLink::new().with_connect_results(vec![Ok(LinkHandle::new(1))]);
         let target = peer("aa:bb:cc:dd:ee:ff", "TV");
         // act
         let handle = link.connect(&target).await.unwrap();
@@ -145,23 +142,6 @@ mod tests {
             link.calls(),
             vec![LinkCall::Connect(target), LinkCall::Disconnect(handle)]
         );
-    }
-
-    #[tokio::test]
-    async fn connect_hands_out_a_distinct_handle_each_time() {
-        // arrange
-        let link = FakeP2pLink::new();
-        // act
-        let first = link
-            .connect(&peer("aa:bb:cc:dd:ee:ff", "TV"))
-            .await
-            .unwrap();
-        let second = link
-            .connect(&peer("00:11:22:33:44:55", "Beamer"))
-            .await
-            .unwrap();
-        // assert
-        assert_ne!(first, second);
     }
 
     #[tokio::test]
@@ -194,6 +174,40 @@ mod tests {
         // assert
         assert_eq!(first, Err(LinkError::PeerUnreachable(mac)));
         assert_eq!(second, Ok(LinkHandle::new(7)));
+    }
+
+    #[tokio::test]
+    async fn connecting_with_nothing_scripted_is_an_error() {
+        // arrange
+        let link = FakeP2pLink::new();
+        // act
+        let err = link
+            .connect(&peer("aa:bb:cc:dd:ee:ff", "TV"))
+            .await
+            .unwrap_err();
+        // assert
+        assert_eq!(
+            err,
+            LinkError::Backend("connect script exhausted".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_connect_beyond_the_end_of_the_script_is_an_error() {
+        // This is the failure a handle-minting fake used to hide: an
+        // implementation that connects twice where the test scripted one
+        // connection would otherwise be handed a second handle and pass.
+        // arrange
+        let link = FakeP2pLink::new().with_connect_results(vec![Ok(LinkHandle::new(1))]);
+        let target = peer("aa:bb:cc:dd:ee:ff", "TV");
+        link.connect(&target).await.unwrap();
+        // act
+        let err = link.connect(&target).await.unwrap_err();
+        // assert
+        assert_eq!(
+            err,
+            LinkError::Backend("connect script exhausted".to_string())
+        );
     }
 
     #[tokio::test]
@@ -245,7 +259,9 @@ mod tests {
     #[tokio::test]
     async fn every_call_is_recorded_in_order() {
         // arrange
-        let link = FakeP2pLink::new().with_stale_groups(vec![GroupId::new("g-1")]);
+        let link = FakeP2pLink::new()
+            .with_connect_results(vec![Ok(LinkHandle::new(1))])
+            .with_stale_groups(vec![GroupId::new("g-1")]);
         let target = peer("aa:bb:cc:dd:ee:ff", "TV");
         // act
         link.scan().await.unwrap();
