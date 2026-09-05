@@ -1,9 +1,5 @@
 //! Turn a `PipelineSpec` into a `gst-launch`-style description string.
 //!
-//! The string deliberately ends at `rtpmp2tpay`: the UDP destination is the
-//! sink's, and it arrives in `wfd_client_rtp_ports` over RTSP in Milestone 2.
-//! The RTSP layer appends the sink once it knows where to send.
-//!
 //! # Provenance of the encoder properties
 //!
 //! It is not uniform, so it is written down rather than assumed:
@@ -18,17 +14,15 @@
 //!   `bitrate_scale`. Constrained Baseline has no B-frames, so it exposes no
 //!   B-frame property at all.
 //!
-//! No string this module emits has ever been run through a live GStreamer
-//! pipeline. The snapshot tests pin the text; only Milestone 3 can pin that
-//! the text actually plays.
+//! The snapshot tests pin the text. Only a live run can pin that the text
+//! actually plays, and that is what `examples/record.rs` is for.
 
-use crate::pipeline::{Encoder, PipelineSpec};
+use crate::pipeline::{Encoder, Output, PipelineSpec};
 
 /// Every encoder-specific name in one place, so no property spelling is
 /// scattered through the builder. Where each spelling came from — and which of
 /// them are measured rather than doc-sourced — is in the module header.
 struct EncoderProps {
-    element: &'static str,
     /// The constant-bitrate switch, spelled differently by each element.
     rate_control: &'static str,
     /// Multiplier from `bitrate_kbps` to the element's own unit.
@@ -44,7 +38,6 @@ struct EncoderProps {
 fn props(encoder: Encoder) -> EncoderProps {
     match encoder {
         Encoder::VaH264 => EncoderProps {
-            element: "vah264enc",
             rate_control: "rate-control=cbr",
             bitrate_scale: 1,
             bframes: Some("b-frames"),
@@ -52,7 +45,6 @@ fn props(encoder: Encoder) -> EncoderProps {
             extra: &[],
         },
         Encoder::X264 => EncoderProps {
-            element: "x264enc",
             rate_control: "pass=cbr",
             bitrate_scale: 1,
             bframes: Some("bframes"),
@@ -60,7 +52,6 @@ fn props(encoder: Encoder) -> EncoderProps {
             extra: &["tune=zerolatency"],
         },
         Encoder::OpenH264 => EncoderProps {
-            element: "openh264enc",
             rate_control: "rate-control=bitrate",
             bitrate_scale: 1000,
             bframes: None,
@@ -70,7 +61,9 @@ fn props(encoder: Encoder) -> EncoderProps {
     }
 }
 
-/// A two-second keyframe interval, expressed in frames.
+/// Two seconds. A sink that joins late, or drops a packet, resynchronises
+/// at the next keyframe, so the interval bounds how long its screen stays
+/// broken.
 fn keyframe_frames(fps: u32) -> u32 {
     2 * fps
 }
@@ -88,29 +81,45 @@ pub fn build(spec: &PipelineSpec) -> String {
     encoder_args.push(format!("{}={}", p.keyframe, keyframe_frames(spec.fps)));
     encoder_args.extend(p.extra.iter().map(|e| (*e).to_string()));
 
+    let tail = match &spec.output {
+        Output::Rtp => "rtpmp2tpay".to_string(),
+        Output::File(path) => format!("filesink location={path}"),
+    };
+
+    // `videorate name=rate` is not shaping anything: at matched input and
+    // output rates it passes buffers straight through. It is here because its
+    // `drop` property is the only dropped-frame count available — a filesink
+    // pipeline posts no QoS messages for the bus to carry.
     let mut pipeline = format!(
-        "pipewiresrc path={node} ! videoconvert ! videoscale ! \
+        "pipewiresrc fd={fd} path={node} do-timestamp=true ! videoconvert ! \
+videorate name=rate ! videoscale ! \
 video/x-raw,width={width},height={height},framerate={fps}/1 ! \
-{element} {args} ! h264parse config-interval=-1 ! mpegtsmux name=mux ! rtpmp2tpay",
-        node = spec.pipewire_node,
+{element} {args} ! h264parse config-interval=-1 ! mpegtsmux name=mux ! {tail}",
+        fd = spec.video_fd,
+        node = spec.video_node,
         width = spec.width,
         height = spec.height,
         fps = spec.fps,
-        element = p.element,
+        element = spec.encoder.element(),
         args = encoder_args.join(" "),
     );
 
     if spec.audio {
-        // LPCM 48 kHz 16-bit stereo is the Wi-Fi Display mandatory audio
-        // codec, so every sink accepts it and the branch needs no encoder
-        // element. S16BE is the byte order MPEG-TS carries LPCM in — and, like
-        // the rest of this string, that is doc-sourced and has never been run
-        // through a live pipeline.
-        pipeline.push_str(&format!(
-            " pipewiresrc path={} ! audioconvert ! audioresample ! \
+        // Two constraints in one fragment. LPCM 48 kHz 16-bit stereo is the
+        // Wi-Fi Display mandatory audio codec, so every sink accepts it and
+        // the branch needs no encoder element; S16BE is the byte order
+        // MPEG-TS carries LPCM in.
+        //
+        // `stream.capture.sink=true` is what makes the branch record what is
+        // playing: WirePlumber reads it and links the stream to the default
+        // sink's monitor ports, and relinks when the default changes. Naming
+        // a sink with `target-object` INSTEAD records the default microphone
+        // — measured — so that property must never appear without this one.
+        pipeline.push_str(
+            " pipewiresrc stream-properties=\"props,stream.capture.sink=true\" \
+do-timestamp=true ! audioconvert ! audioresample ! \
 audio/x-raw,format=S16BE,rate=48000,channels=2 ! mux.",
-            spec.audio_node
-        ));
+        );
     }
 
     pipeline
@@ -119,6 +128,7 @@ audio/x-raw,format=S16BE,rate=48000,channels=2 ! mux.",
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline::Output;
 
     fn spec(encoder: Encoder, audio: bool) -> PipelineSpec {
         PipelineSpec {
@@ -128,15 +138,26 @@ mod tests {
             fps: 60,
             bitrate_kbps: 20_000,
             audio,
-            pipewire_node: 42,
-            audio_node: 43,
+            video_node: 42,
+            video_fd: 40,
+            output: Output::Rtp,
         }
     }
 
-    const VIDEO_HEAD: &str = "pipewiresrc path=42 ! videoconvert ! videoscale ! \
+    fn file_spec(audio: bool) -> PipelineSpec {
+        PipelineSpec {
+            output: Output::File("/tmp/glint-test.ts".to_string()),
+            ..spec(Encoder::VaH264, audio)
+        }
+    }
+
+    const VIDEO_HEAD: &str = "pipewiresrc fd=40 path=42 do-timestamp=true ! \
+videoconvert ! videorate name=rate ! videoscale ! \
 video/x-raw,width=1920,height=1080,framerate=60/1 ! ";
     const VIDEO_TAIL: &str = " ! h264parse config-interval=-1 ! mpegtsmux name=mux ! rtpmp2tpay";
-    const AUDIO_BRANCH: &str = " pipewiresrc path=43 ! audioconvert ! audioresample ! \
+    const AUDIO_BRANCH: &str = " pipewiresrc \
+stream-properties=\"props,stream.capture.sink=true\" do-timestamp=true ! \
+audioconvert ! audioresample ! \
 audio/x-raw,format=S16BE,rate=48000,channels=2 ! mux.";
 
     // ---- the six snapshots ----
@@ -296,8 +317,10 @@ gop-size=120{VIDEO_TAIL}{AUDIO_BRANCH}"
         assert!(build(&spec(Encoder::OpenH264, false)).contains("rate-control=bitrate"));
     }
 
+    // ---- the two output tails ----
+
     #[test]
-    fn the_string_stops_at_the_payloader_with_no_destination() {
+    fn the_rtp_output_stops_at_the_payloader_with_no_destination() {
         // The sink's host and port arrive in wfd_client_rtp_ports over RTSP,
         // in Milestone 2. Emitting a udpsink here would mean inventing them.
         // act
@@ -308,10 +331,88 @@ gop-size=120{VIDEO_TAIL}{AUDIO_BRANCH}"
     }
 
     #[test]
-    fn the_audio_node_is_ignored_when_audio_is_off() {
+    fn the_file_output_ends_at_filesink_and_never_reaches_the_payloader() {
+        // act
+        let built = build(&file_spec(false));
+        // assert
+        assert!(
+            built.ends_with("filesink location=/tmp/glint-test.ts"),
+            "got: {built}"
+        );
+        assert!(!built.contains("rtpmp2tpay"), "got: {built}");
+    }
+
+    // ---- the D10 additions ----
+
+    #[test]
+    fn the_audio_branch_carries_the_capture_sink_property() {
+        // WirePlumber honours stream.capture.sink=true by linking the stream to
+        // the default sink's monitor ports. Without the clause the branch
+        // records the default microphone instead of what is playing.
+        // act
+        let built = build(&spec(Encoder::VaH264, true));
+        // assert
+        assert!(
+            built.contains("stream-properties=\"props,stream.capture.sink=true\""),
+            "got: {built}"
+        );
+    }
+
+    #[test]
+    fn no_output_variant_ever_emits_target_object() {
+        // target-object alone links pipewiresrc to the default microphone —
+        // measured. It is honoured only together with stream.capture.sink, so
+        // until a pinned-sink setting exists it must never appear at all.
+        // act & assert
+        for built in [
+            build(&spec(Encoder::VaH264, true)),
+            build(&spec(Encoder::VaH264, false)),
+            build(&file_spec(true)),
+            build(&file_spec(false)),
+        ] {
+            assert!(!built.contains("target-object"), "got: {built}");
+        }
+    }
+
+    #[test]
+    fn the_video_chain_carries_a_named_videorate() {
+        // Task 22 polls this element's `drop` property for the dropped-frame
+        // count: a filesink pipeline posts no QoS messages, so the bus cannot
+        // supply it. The name is how the runner finds the element.
         // act
         let built = build(&spec(Encoder::VaH264, false));
         // assert
-        assert!(!built.contains("path=43"), "got: {built}");
+        assert!(built.contains("videorate name=rate"), "got: {built}");
+    }
+
+    #[test]
+    fn both_sources_ask_pipewiresrc_to_timestamp_its_buffers() {
+        // act
+        let built = build(&spec(Encoder::VaH264, true));
+        // assert
+        assert_eq!(
+            built.matches("do-timestamp=true").count(),
+            2,
+            "got: {built}"
+        );
+    }
+
+    #[test]
+    fn the_video_source_carries_the_portal_fd_and_node_id() {
+        // The portal grants access through the fd; the node id picks the stream
+        // out of that remote. Both come from one Capture value.
+        // act
+        let built = build(&spec(Encoder::VaH264, false));
+        // assert
+        assert!(built.contains("pipewiresrc fd=40 path=42"), "got: {built}");
+    }
+
+    #[test]
+    fn the_audio_branch_is_absent_when_audio_is_off() {
+        // act
+        let built = build(&spec(Encoder::VaH264, false));
+        // assert
+        assert!(!built.contains("audioconvert"), "got: {built}");
+        assert!(!built.contains("stream.capture.sink"), "got: {built}");
     }
 }
