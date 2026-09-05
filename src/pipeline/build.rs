@@ -29,7 +29,7 @@ struct EncoderProps {
     bitrate_scale: u32,
     /// The B-frame property name, or `None` when the element has none.
     bframes: Option<&'static str>,
-    /// The keyframe-interval property name; set to two seconds of frames.
+    /// The keyframe-interval property name.
     keyframe: &'static str,
     /// Anything else the element needs, appended verbatim.
     extra: &'static [&'static str],
