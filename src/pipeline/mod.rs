@@ -5,6 +5,7 @@
 //! single GStreamer element.
 
 pub mod build;
+pub mod encoder;
 
 use serde::{Deserialize, Serialize};
 
