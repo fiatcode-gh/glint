@@ -2,6 +2,7 @@
 //! record alongside it.
 
 pub mod audio;
+pub mod portal;
 
 use std::os::fd::OwnedFd;
 
