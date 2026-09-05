@@ -107,16 +107,21 @@ fn resolve_dir(
     Ok(PathBuf::from(home).join(".config").join("glint"))
 }
 
-/// The temp file is a sibling of the target rather than a file in the system
-/// temp directory: `rename` is only atomic within one filesystem. It is also
-/// removed on the error path so a failed save leaves nothing behind.
-fn write_atomically(path: &Path, contents: &str) -> std::io::Result<()> {
+/// A sibling of the target rather than a file in the system temp directory:
+/// `rename` is only atomic within one filesystem, and on this host `/tmp` is
+/// a different one from the config directory.
+fn temp_path(path: &Path) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(".tmp");
-    let tmp = path.with_file_name(name);
+    path.with_file_name(name)
+}
+
+fn write_atomically(path: &Path, contents: &str) -> std::io::Result<()> {
+    let tmp = temp_path(path);
     match fs::write(&tmp, contents).and_then(|()| fs::rename(&tmp, path)) {
         Ok(()) => Ok(()),
         Err(e) => {
+            // A save that fails must not leave its scratch file behind.
             let _ = fs::remove_file(&tmp);
             Err(e)
         }
@@ -282,6 +287,37 @@ pub(crate) mod tests {
         let err = resolve_dir(None, None).unwrap_err();
         // assert
         assert!(matches!(err, StoreError::NoHome), "got: {err:?}");
+    }
+
+    #[test]
+    fn the_scratch_file_sits_beside_the_target() {
+        // Nothing else observes where the scratch file goes: on the success
+        // path it is already gone, and on the error path it is deleted. Only
+        // this pins it to the target's own directory.
+        // act
+        let tmp = temp_path(Path::new("/x/cfg/glint/settings.toml"));
+        // assert
+        assert_eq!(tmp.parent(), Some(Path::new("/x/cfg/glint")));
+        assert_ne!(tmp, PathBuf::from("/x/cfg/glint/settings.toml"));
+    }
+
+    #[test]
+    fn a_failed_write_leaves_no_scratch_file_behind() {
+        // arrange
+        // A directory sitting where the file belongs makes the rename fail
+        // after the scratch file has already been written.
+        let dir = TempDir::new("atomic-error-path");
+        let target = dir.path().join("settings.toml");
+        fs::create_dir_all(&target).unwrap();
+        // act
+        let result = write_atomically(&target, "new");
+        // assert
+        assert!(result.is_err());
+        let left: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, ["settings.toml"]);
     }
 
     #[test]

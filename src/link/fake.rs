@@ -85,8 +85,8 @@ impl P2pLink for FakeP2pLink {
         Ok(lock(&self.stale_groups).clone())
     }
 
-    /// Task 17 cleans up by removing every stale group and re-reading the
-    /// list, so a removal has to stick rather than only be recorded.
+    /// A removal has to stick rather than merely be recorded: the cleanup
+    /// path removes every stale group and then re-reads the list.
     async fn remove_group(&self, id: GroupId) -> Result<(), LinkError> {
         self.record(LinkCall::RemoveGroup(id.clone()));
         lock(&self.stale_groups).retain(|g| g != &id);
@@ -131,16 +131,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connect_hands_out_a_handle() {
+    async fn connect_hands_out_a_handle_that_disconnect_accepts() {
+        // The handle's value is deliberately not asserted: `LinkHandle` is
+        // opaque, so what it carries is the fake's business.
         // arrange
         let link = FakeP2pLink::new();
+        let target = peer("aa:bb:cc:dd:ee:ff", "TV");
         // act
-        let handle = link
-            .connect(&peer("aa:bb:cc:dd:ee:ff", "TV"))
-            .await
-            .unwrap();
+        let handle = link.connect(&target).await.unwrap();
+        link.disconnect(handle).await.unwrap();
         // assert
-        assert_eq!(handle, LinkHandle::new(1));
+        assert_eq!(
+            link.calls(),
+            vec![LinkCall::Connect(target), LinkCall::Disconnect(handle)]
+        );
     }
 
     #[tokio::test]

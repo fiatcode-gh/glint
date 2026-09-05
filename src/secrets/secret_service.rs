@@ -8,9 +8,10 @@ use crate::receiver::MacAddr;
 
 pub struct SecretServiceStore {
     collection: Collection,
-    /// Dropping the `Service` closes the D-Bus session the collection was
-    /// opened on, so it is held for the store's whole lifetime rather than
-    /// reconnected per call.
+    /// Held for the store's whole lifetime so no operation reconnects, and
+    /// declared after `collection` on purpose: fields drop in declaration
+    /// order, and oo7 closes the D-Bus session only once the collection has
+    /// released its own reference to it.
     _service: Service,
 }
 

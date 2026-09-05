@@ -34,10 +34,6 @@ impl GroupId {
     pub fn new(id: impl Into<String>) -> Self {
         GroupId(id.into())
     }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

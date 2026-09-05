@@ -1,8 +1,8 @@
 //! Manual driver for the Secret Service store: set, read back, delete.
 //!
-//! Task 13 has no automated test. Run this with the wallet visible and watch
-//! the entry appear and vanish in the wallet's own interface — that half is
-//! what no test in this crate can assert.
+//! Nothing in the crate covers this path automatically. Run it against a
+//! live Secret Service and watch the entry appear and vanish — the wallet
+//! side is what no test in this crate can assert.
 
 use glint::receiver::MacAddr;
 use glint::secrets::SecretStore;

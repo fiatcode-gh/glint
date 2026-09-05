@@ -7,7 +7,7 @@ use crate::receiver::MacAddr;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SecretError {
-    #[error("the secret service is unavailable: {0}")]
+    #[error("the secret service request failed: {0}")]
     Service(#[from] oo7::dbus::Error),
     #[error("the stored secret for {mac} is not valid UTF-8")]
     NotUtf8 { mac: MacAddr },
