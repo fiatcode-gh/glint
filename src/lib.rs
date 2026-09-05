@@ -6,6 +6,7 @@
 //! and tests on a machine with no GStreamer, no display and no network.
 
 pub mod config;
+pub mod link;
 pub mod pipeline;
 pub mod receiver;
 pub mod reconnect;
