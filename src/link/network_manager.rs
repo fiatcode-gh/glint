@@ -121,6 +121,10 @@ const WFD_SOURCE_IES: [u8; 9] = [0x00, 0x00, 0x06, 0x00, 0x90, 0x1c, 0x44, 0x00,
 
 /// A peer's three properties as NetworkManager reports them, before glint
 /// has decided whether the peer is a Wi-Fi Display sink at all.
+///
+/// Public only so `advertised_peers` can hand it to a diagnostic caller.
+/// `Peer` is what the link layer promises callers; this is the wire truth
+/// behind it, and it is not the place to add capability fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawPeer {
     pub name: String,
@@ -298,10 +302,14 @@ impl NetworkManagerLink {
     /// find of its own, so a caller that has just scanned can see what was
     /// advertised without paying for a second window.
     ///
-    /// Public because `Peer` deliberately carries no information-element
-    /// field, which leaves this the only way to read a real sink's
-    /// advertised WFD bytes — and those bytes are what tells a sink that
-    /// answered from one that was filtered out for advertising none.
+    /// This exists for diagnostics and for the examples, and for nothing
+    /// else. `Peer` is the trait's public currency and stays that way:
+    /// `scan` is what callers are meant to use, and it returns `Peer`.
+    /// What this adds is the raw information-element bytes, which `Peer`
+    /// deliberately has no field for and which are the only way to tell a
+    /// sink that answered from a neighbour dropped for advertising none.
+    /// Do not grow an API on `RawPeer` — capability fields belong on
+    /// `Peer`, where the session logic can reach them.
     pub async fn advertised_peers(&self) -> Result<Vec<RawPeer>, LinkError> {
         let device = self.device().await?;
         let mut seen = Vec::new();
