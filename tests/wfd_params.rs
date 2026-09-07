@@ -199,3 +199,18 @@ fn the_real_sink_reply_fixture_round_trips() {
     // assert
     assert_eq!(parsed.format(), fixture);
 }
+
+#[test]
+fn an_empty_codec_list_formats_without_a_trailing_space() {
+    // Unreachable through `parse`, which demands at least one codec entry,
+    // but Task 24 hand-constructs a VideoFormats for the M4 body and a
+    // trailing space would land on the wire.
+    // arrange
+    let empty = VideoFormats {
+        native: 0,
+        preferred_display_mode: 0,
+        codecs: Vec::new(),
+    };
+    // act & assert
+    assert_eq!(empty.format(), "00 00");
+}
