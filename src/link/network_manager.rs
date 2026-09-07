@@ -49,6 +49,22 @@ trait Manager {
     )>;
 
     fn deactivate_connection(&self, active_connection: &ObjectPath<'_>) -> zbus::Result<()>;
+
+    #[zbus(property)]
+    fn active_connections(&self) -> zbus::Result<Vec<OwnedObjectPath>>;
+}
+
+/// Only `Connection` is needed here: it maps an activation back to the
+/// profile it activates, which is how cleanup tells a connection that is
+/// carrying somebody's cast from one that is merely left over.
+#[zbus::proxy(
+    interface = "org.freedesktop.NetworkManager.Connection.Active",
+    default_service = "org.freedesktop.NetworkManager",
+    assume_defaults = false
+)]
+trait ActiveConnection {
+    #[zbus(property)]
+    fn connection(&self) -> zbus::Result<OwnedObjectPath>;
 }
 
 #[zbus::proxy(
@@ -225,10 +241,22 @@ fn connection_settings(mac: MacAddr, ies: &[u8]) -> ConnectionSettings {
 
 /// A prefix test, not a substring test: a connection that merely mentions
 /// the phrase mid-id belongs to someone else and must not be deleted.
-fn stale_connection_paths<P: Clone>(connections: &[(String, P)]) -> Vec<P> {
+///
+/// Anything currently active is excluded even when the name matches,
+/// because an active `glint p2p …` connection is somebody's running cast —
+/// a second glint starting up must not delete the first one's link. The
+/// cost is that a leftover NetworkManager still reports as active never
+/// gets cleaned here, which is the right way round: `persist = volatile`
+/// and `bind-activation = dbus-client` already cover the crash case twice
+/// over, so this gives up a case those handle to avoid one they cannot.
+fn stale_connection_paths<P: Clone + PartialEq>(
+    connections: &[(String, P)],
+    active: &[P],
+) -> Vec<P> {
     connections
         .iter()
         .filter(|(id, _)| id.starts_with(GLINT_CONNECTION_PREFIX))
+        .filter(|(_, path)| !active.contains(path))
         .map(|(_, path)| path.clone())
         .collect()
 }
@@ -376,14 +404,51 @@ impl NetworkManagerLink {
         let device = self.device().await?;
         let mut seen = Vec::new();
         for path in device.peers().await.map_err(backend)? {
-            let peer = self.peer(path).await?;
-            seen.push(RawPeer {
-                name: peer.name().await.map_err(backend)?,
-                hw_address: peer.hw_address().await.map_err(backend)?,
-                wfd_ies: peer.wfd_ies().await.map_err(backend)?,
-            });
+            match self.read_peer(path.clone()).await {
+                Ok(peer) => seen.push(peer),
+                // A peer object expires the moment its find lapses, so a
+                // failed read here usually means the neighbour simply went
+                // away mid-scan. Same rule as an address that will not
+                // parse: drop the one peer rather than throw away every
+                // peer already resolved.
+                Err(error) => tracing::warn!(
+                    peer = %path.as_str(),
+                    %error,
+                    "skipping a peer whose properties could not be read"
+                ),
+            }
         }
         Ok(seen)
+    }
+
+    async fn read_peer(&self, path: OwnedObjectPath) -> Result<RawPeer, LinkError> {
+        let peer = self.peer(path).await?;
+        Ok(RawPeer {
+            name: peer.name().await.map_err(backend)?,
+            hw_address: peer.hw_address().await.map_err(backend)?,
+            wfd_ies: peer.wfd_ies().await.map_err(backend)?,
+        })
+    }
+
+    /// The profile paths NetworkManager currently has activations for, so
+    /// cleanup can leave a running cast alone.
+    async fn active_profiles(&self) -> Result<Vec<OwnedObjectPath>, LinkError> {
+        let manager = ManagerProxy::new(&self.connection).await.map_err(backend)?;
+        let mut active = Vec::new();
+        for path in manager.active_connections().await.map_err(backend)? {
+            let proxy = ActiveConnectionProxy::builder(&self.connection)
+                .path(path)
+                .map_err(backend)?
+                .build()
+                .await
+                .map_err(backend)?;
+            // An activation that vanishes between the list and this read is
+            // one that is no longer live, so it needs no protecting.
+            if let Ok(profile) = proxy.connection().await {
+                active.push(profile);
+            }
+        }
+        Ok(active)
     }
 }
 
@@ -465,9 +530,9 @@ impl P2pLink for NetworkManagerLink {
         Ok(())
     }
 
-    /// Filters by id prefix rather than by liveness: whether an active
-    /// volatile connection is even listed here is unmeasured, so the
-    /// prefix is the only signal trusted.
+    /// An active volatile connection IS listed by `ListConnections`
+    /// (measured against NetworkManager 1.56.1), so the id prefix alone
+    /// cannot decide what is stale — hence the active-profile exclusion.
     async fn stale_groups(&self) -> Result<Vec<GroupId>, LinkError> {
         let settings = SettingsProxy::new(&self.connection)
             .await
@@ -491,10 +556,12 @@ impl P2pLink for NetworkManagerLink {
                 ),
             }
         }
-        Ok(stale_connection_paths(&named)
-            .into_iter()
-            .map(|path| GroupId::new(path.as_str()))
-            .collect())
+        Ok(
+            stale_connection_paths(&named, &self.active_profiles().await?)
+                .into_iter()
+                .map(|path| GroupId::new(path.as_str()))
+                .collect(),
+        )
     }
 
     async fn remove_group(&self, id: GroupId) -> Result<(), LinkError> {
@@ -760,9 +827,24 @@ mod tests {
             ("glint p2p 00:11:22:33:44:55".to_string(), "/settings/4"),
         ];
         // act
-        let stale = stale_connection_paths(&connections);
+        let stale = stale_connection_paths(&connections, &[]);
         // assert
         assert_eq!(stale, vec!["/settings/2", "/settings/4"]);
+    }
+
+    #[test]
+    fn a_glint_connection_that_is_currently_active_is_not_stale() {
+        // A live `glint p2p ...` connection is somebody's running cast, so a
+        // second glint's startup cleanup must leave it alone.
+        // arrange
+        let connections = vec![
+            ("glint p2p aa:bb:cc:dd:ee:ff".to_string(), "/settings/2"),
+            ("glint p2p 00:11:22:33:44:55".to_string(), "/settings/4"),
+        ];
+        // act
+        let stale = stale_connection_paths(&connections, &["/settings/4"]);
+        // assert
+        assert_eq!(stale, vec!["/settings/2"]);
     }
 
     #[test]
@@ -770,7 +852,7 @@ mod tests {
         // arrange
         let connections = vec![("not the glint p2p one".to_string(), "/settings/9")];
         // act
-        let stale = stale_connection_paths(&connections);
+        let stale = stale_connection_paths(&connections, &[]);
         // assert
         assert!(stale.is_empty());
     }
