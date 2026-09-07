@@ -117,12 +117,11 @@ video/x-raw,width={width},height={height},framerate={fps}/1 ! \
         // produces it from live audio — the only sources of that media type
         // are demuxers, for remuxing an existing transport stream. AAC-LC is
         // the specification's optional codec that every sink implements in
-        // practice. `aacparse` is required, not decoration: mpegtsmux demands
-        // `framed=true` on audio/mpeg.
+        // practice.
         pipeline.push_str(
             " pipewiresrc stream-properties=\"props,stream.capture.sink=true\" \
 do-timestamp=true ! audioconvert ! audioresample ! \
-audio/x-raw,rate=48000,channels=2 ! avenc_aac ! aacparse ! mux.",
+audio/x-raw,rate=48000,channels=2 ! avenc_aac ! mux.",
         );
     }
 
@@ -161,8 +160,7 @@ video/x-raw,width=1920,height=1080,framerate=60/1 ! ";
     const VIDEO_TAIL: &str = " ! h264parse config-interval=-1 ! mpegtsmux name=mux ! rtpmp2tpay";
     const AUDIO_BRANCH: &str = " pipewiresrc \
 stream-properties=\"props,stream.capture.sink=true\" do-timestamp=true ! \
-audioconvert ! audioresample ! audio/x-raw,rate=48000,channels=2 ! \
-avenc_aac ! aacparse ! mux.";
+audioconvert ! audioresample ! audio/x-raw,rate=48000,channels=2 ! avenc_aac ! mux.";
 
     // ---- the six snapshots ----
 
