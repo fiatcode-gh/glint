@@ -261,6 +261,15 @@ Transport: RTP/AVP/UDP;unicast;client_port=19000;server_port=16384-16385\r\n\r\n
     );
     assert_eq!(
         next_event(&mut events).await,
+        FlowEvent::Negotiated {
+            width: 1920,
+            height: 1080,
+            fps: 30,
+            audio: true,
+        }
+    );
+    assert_eq!(
+        next_event(&mut events).await,
         FlowEvent::Play {
             rtp_host: "127.0.0.1".to_string(),
             rtp_port: 19000,
@@ -279,6 +288,10 @@ async fn a_sink_hangup_after_play_is_a_teardown() {
     assert!(matches!(
         next_event(&mut events).await,
         FlowEvent::M3Captured(_)
+    ));
+    assert!(matches!(
+        next_event(&mut events).await,
+        FlowEvent::Negotiated { .. }
     ));
     assert!(matches!(
         next_event(&mut events).await,
@@ -315,6 +328,10 @@ async fn an_inbound_teardown_is_answered_before_the_socket_closes() {
     ));
     assert!(matches!(
         next_event(&mut events).await,
+        FlowEvent::Negotiated { .. }
+    ));
+    assert!(matches!(
+        next_event(&mut events).await,
         FlowEvent::Play { .. }
     ));
     assert_eq!(next_event(&mut events).await, FlowEvent::Teardown);
@@ -340,6 +357,15 @@ async fn an_lpcm_only_sink_is_cast_to_without_audio() {
         next_event(&mut events).await,
         FlowEvent::M3Captured(_)
     ));
+    assert_eq!(
+        next_event(&mut events).await,
+        FlowEvent::Negotiated {
+            width: 1920,
+            height: 1080,
+            fps: 30,
+            audio: false,
+        }
+    );
     assert!(matches!(
         next_event(&mut events).await,
         FlowEvent::Play { .. }

@@ -417,6 +417,17 @@ pub enum FlowEvent {
     /// The M3 reply body, verbatim. Normalising it would destroy the bytes the
     /// real-television fixture is meant to record.
     M3Captured(Vec<u8>),
+    /// What the negotiation settled on, announced as soon as it is decided.
+    ///
+    /// `Play` deliberately carries only the destination, but the caller builds
+    /// its pipeline at PLAY out of both — so the format is announced here, at
+    /// the moment it is chosen, and the caller holds it until PLAY arrives.
+    Negotiated {
+        width: u32,
+        height: u32,
+        fps: u32,
+        audio: bool,
+    },
     /// The sink is playing: start the pipeline pointed here.
     Play {
         rtp_host: String,
@@ -861,7 +872,18 @@ impl Flow {
         let cseq = self.next_cseq();
         let m4 = build_m4(cseq, &chosen, self.audio.as_ref(), self.local, &sink_ports);
         let out = self.send_awaiting(m4, FlowState::AwaitingM4Reply, now);
-        (out, vec![captured])
+        (
+            out,
+            vec![
+                captured,
+                FlowEvent::Negotiated {
+                    width: chosen.width,
+                    height: chosen.height,
+                    fps: chosen.fps,
+                    audio: self.audio.is_some(),
+                },
+            ],
+        )
     }
 }
 
@@ -2130,5 +2152,62 @@ Content-Type: text/parameters\r\nContent-Length: {}\r\n\r\n{body}",
         // assert
         assert!(out.is_empty());
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn the_negotiated_format_is_announced_when_it_is_decided() {
+        // The caller builds its pipeline at PLAY, but PLAY carries only the
+        // destination — so the format has to reach it when it is settled.
+        // arrange
+        let mut flow = flow();
+        flow.on_tick(Duration::from_millis(500));
+        flow.on_message(&response(1, ""), Duration::from_secs(1));
+        // act
+        let (_, events) = flow.on_message(&response(2, SINK_M3_REPLY), Duration::from_secs(2));
+        // assert
+        assert!(events.contains(&FlowEvent::Negotiated {
+            width: 1920,
+            height: 1080,
+            fps: 30,
+            audio: true,
+        }));
+    }
+
+    #[test]
+    fn the_announcement_says_so_when_there_is_no_audio() {
+        // arrange
+        let mut flow = flow();
+        flow.on_tick(Duration::from_millis(500));
+        flow.on_message(&response(1, ""), Duration::from_secs(1));
+        let lpcm = SINK_M3_REPLY.replace("AAC 00000007 00", "LPCM 00000002 00");
+        // act
+        let (_, events) = flow.on_message(&response(2, &lpcm), Duration::from_secs(2));
+        // assert
+        assert!(events.contains(&FlowEvent::Negotiated {
+            width: 1920,
+            height: 1080,
+            fps: 30,
+            audio: false,
+        }));
+    }
+
+    #[test]
+    fn a_failed_negotiation_announces_no_format() {
+        // arrange
+        let mut flow = flow();
+        flow.on_tick(Duration::from_millis(500));
+        flow.on_message(&response(1, ""), Duration::from_secs(1));
+        let hdcp = SINK_M3_REPLY.replace(
+            "wfd_content_protection: none",
+            "wfd_content_protection: HDCP2.0 port=1189",
+        );
+        // act
+        let (_, events) = flow.on_message(&response(2, &hdcp), Duration::from_secs(2));
+        // assert
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, FlowEvent::Negotiated { .. }))
+        );
     }
 }
