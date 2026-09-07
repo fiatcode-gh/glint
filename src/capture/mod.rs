@@ -35,9 +35,11 @@ pub struct Capture {
     /// the launch string carries only the descriptor number, so dropping this
     /// closes the stream out from under a running capture.
     pub fd: OwnedFd,
-    /// Fresh on every successful start, because a restore token is
-    /// single-use. Overwrite the stored one with this, or the next run shows
-    /// the picker again.
+    /// Overwrite the stored token with this after every successful start.
+    /// Whether the portal issues a new token or returns the same one is
+    /// implementation-dependent — xdg-desktop-portal-kde handed back an
+    /// identical token on restore when this was measured — and overwriting
+    /// unconditionally is correct under either behaviour.
     pub restore_token: Option<String>,
 }
 

@@ -21,6 +21,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("restore token out: {:?}", capture.restore_token);
     println!();
     println!("--- rerun with that token as the first argument; the picker must NOT appear ---");
-    println!("--- a token is single-use: each run prints a fresh one to carry forward ---");
+    println!("--- carry the printed token forward; a stale one falls back to the picker ---");
     Ok(())
 }
