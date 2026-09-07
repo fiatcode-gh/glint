@@ -10,7 +10,11 @@
 //!     cargo run --example record -- <a restore token from examples/capture>
 //!
 //! Then play it back and check that video and audio are both there, and in
-//! sync:  mpv /tmp/glint-record.ts
+//! sync. Use a player that carries its own decoders — a distribution whose
+//! ffmpeg ships only the openh264 stub cannot decode this file, which rules
+//! out ffplay and ffprobe on Fedora:
+//!
+//!     flatpak run org.kde.haruna /tmp/glint-record.ts
 
 use std::os::fd::AsRawFd;
 
@@ -52,7 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::thread::sleep(std::time::Duration::from_secs(1));
         let stats = runner.sample();
         println!(
-            "t+{second}s  bytes/s {:>9}  dropped {}",
+            "t+{second}s  bytes/s {:>9}  dropped {} (total)",
             stats.bytes_per_second, stats.dropped_frames
         );
     }
@@ -65,7 +69,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!();
     println!("wrote {}", path.display());
-    println!("--- play it: mpv {} ---", path.display());
+    println!(
+        "--- play it: flatpak run org.kde.haruna {} ---",
+        path.display()
+    );
     println!("--- video AND audio, and in sync? that is the gate ---");
     Ok(())
 }

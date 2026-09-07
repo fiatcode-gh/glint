@@ -101,8 +101,11 @@ impl Runner {
 
     /// Swaps the byte counter rather than reading it, so each sample reports
     /// the window since the previous one: a caller polling once a second gets
-    /// a rate without keeping its own arithmetic. The drop count is cumulative
-    /// because videorate owns it and only ever counts up.
+    /// a rate without keeping its own arithmetic.
+    ///
+    /// The two fields are not the same KIND of number. `dropped_frames` is
+    /// cumulative, because videorate owns that counter and only ever counts
+    /// up, so a caller printing them side by side should say which is which.
     pub fn sample(&self) -> Stats {
         Stats {
             bytes_per_second: self.bytes.swap(0, Ordering::Relaxed),
