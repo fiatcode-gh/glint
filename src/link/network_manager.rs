@@ -122,10 +122,10 @@ const WFD_SOURCE_IES: [u8; 9] = [0x00, 0x00, 0x06, 0x00, 0x90, 0x1c, 0x44, 0x00,
 /// A peer's three properties as NetworkManager reports them, before glint
 /// has decided whether the peer is a Wi-Fi Display sink at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct RawPeer {
-    name: String,
-    hw_address: String,
-    wfd_ies: Vec<u8>,
+pub struct RawPeer {
+    pub name: String,
+    pub hw_address: String,
+    pub wfd_ies: Vec<u8>,
 }
 
 /// Keeping only peers that advertise Wi-Fi Display information elements is
@@ -293,6 +293,28 @@ impl NetworkManagerLink {
         *next += 1;
         LinkHandle::new(*next)
     }
+
+    /// Reads the peers NetworkManager currently lists without starting a
+    /// find of its own, so a caller that has just scanned can see what was
+    /// advertised without paying for a second window.
+    ///
+    /// Public because `Peer` deliberately carries no information-element
+    /// field, which leaves this the only way to read a real sink's
+    /// advertised WFD bytes — and those bytes are what tells a sink that
+    /// answered from one that was filtered out for advertising none.
+    pub async fn advertised_peers(&self) -> Result<Vec<RawPeer>, LinkError> {
+        let device = self.device().await?;
+        let mut seen = Vec::new();
+        for path in device.peers().await.map_err(backend)? {
+            let peer = self.peer(path).await?;
+            seen.push(RawPeer {
+                name: peer.name().await.map_err(backend)?,
+                hw_address: peer.hw_address().await.map_err(backend)?,
+                wfd_ies: peer.wfd_ies().await.map_err(backend)?,
+            });
+        }
+        Ok(seen)
+    }
 }
 
 impl P2pLink for NetworkManagerLink {
@@ -306,16 +328,7 @@ impl P2pLink for NetworkManagerLink {
         // full window to answer. An early-return loop is the tempting
         // "optimization" here and it can return before the TV has replied.
         tokio::time::sleep(SCAN_WINDOW).await;
-        let mut seen = Vec::new();
-        for path in device.peers().await.map_err(backend)? {
-            let peer = self.peer(path).await?;
-            seen.push(RawPeer {
-                name: peer.name().await.map_err(backend)?,
-                hw_address: peer.hw_address().await.map_err(backend)?,
-                wfd_ies: peer.wfd_ies().await.map_err(backend)?,
-            });
-        }
-        Ok(wfd_peers(&seen))
+        Ok(wfd_peers(&self.advertised_peers().await?))
     }
 
     /// `Peers` is re-read rather than carried over from `scan`, because
