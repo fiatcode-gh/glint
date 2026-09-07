@@ -2,6 +2,7 @@
 //! logic is testable without a radio.
 
 pub mod fake;
+pub mod network_manager;
 
 use crate::receiver::MacAddr;
 
@@ -33,6 +34,10 @@ pub struct GroupId(String);
 impl GroupId {
     pub fn new(id: impl Into<String>) -> Self {
         GroupId(id.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
