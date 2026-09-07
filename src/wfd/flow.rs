@@ -184,6 +184,15 @@ pub fn build_m16(cseq: u32, session: &str) -> Vec<u8> {
     ))
 }
 
+/// The parameters glint asks for in M3 and reads back. Anything else in a
+/// reply is a vendor extension, which is normal.
+const KNOWN_M3_PARAMETERS: [&str; 4] = [
+    "wfd_video_formats",
+    "wfd_audio_codecs",
+    "wfd_client_rtp_ports",
+    "wfd_content_protection",
+];
+
 /// The methods glint answers, with the WFD profile token first — GND prepends
 /// exactly this, and the sink reads the list to decide what it may send.
 const PUBLIC_METHODS: &str =
@@ -191,7 +200,10 @@ const PUBLIC_METHODS: &str =
 
 /// The RTP and RTCP ports glint's udpsink binds, quoted back in the M6 reply
 /// so the advertisement matches the pipeline's own `bind-port`.
-const SERVER_PORTS: &str = "server_port=16384-16385";
+///
+/// Public so the pipeline's own test can pin the two against each other
+/// rather than trusting two copies of one number to stay equal.
+pub const SERVER_PORTS: &str = "server_port=16384-16385";
 
 /// A 200 reply carrying the request's CSeq.
 ///
@@ -484,6 +496,9 @@ impl Flow {
         }
     }
 
+    /// Where the flow is. Read by tests, and by anything that needs to
+    /// distinguish "still handshaking" from "streaming" without waiting for
+    /// the next event.
     pub fn state(&self) -> FlowState {
         self.state
     }
@@ -492,13 +507,17 @@ impl Flow {
         self.session.as_deref()
     }
 
-    /// The negotiated video format, once M3 has been answered. The pipeline
-    /// needs it and `FlowEvent::Play` deliberately carries only the
-    /// destination, so it is read from here.
+    /// The negotiated video format, once M3 has been answered.
+    ///
+    /// `FlowEvent::Negotiated` is how a caller outside this module learns
+    /// this, because the `Flow` itself lives inside the driver and is
+    /// unreachable from there. These two accessors exist for a caller that
+    /// owns a `Flow` directly — the flow's own tests today.
     pub fn chosen_format(&self) -> Option<ChosenFormat> {
         self.chosen
     }
 
+    /// Whether the negotiation settled on audio. See `chosen_format`.
     pub fn audio_selected(&self) -> bool {
         self.audio.is_some()
     }
@@ -515,6 +534,13 @@ impl Flow {
         vec![Outbound::Bytes(bytes)]
     }
 
+    /// End the flow by closing the socket, never by sending TEARDOWN.
+    ///
+    /// Closing is the field norm in both directions: the reference sink never
+    /// sends M8 either, and a source that does send one waits out its own
+    /// timeout because the sink replies to nothing outside
+    /// OPTIONS/GET_PARAMETER/SET_PARAMETER. So glint never sends M8 and never
+    /// blocks on a teardown reply.
     fn fail(&mut self, reason: String) -> (Vec<Outbound>, Vec<FlowEvent>) {
         self.state = FlowState::Done;
         (vec![Outbound::Close], vec![FlowEvent::Failed(reason)])
@@ -578,7 +604,6 @@ impl Flow {
             return (Vec::new(), Vec::new());
         }
 
-        // Any inbound message counts as liveness, once the session exists.
         if self.session.is_some() {
             self.last_inbound = Some(now);
         }
@@ -655,12 +680,16 @@ impl Flow {
             }
             Method::Setup => self.on_setup(request, cseq, now),
             Method::Play => self.on_play(cseq),
+            // Answered, not acted on. PAUSE is advertised because the Public
+            // list is GND's field-proven verbatim string, so a sink is
+            // entitled to send it — and tearing the cast down over a method
+            // glint told it to use would be the worse failure. Actually
+            // pausing the pipeline needs the daemon that owns it, which is
+            // Milestone 3; until then the sink simply stops reading.
+            Method::Pause => (vec![Outbound::Bytes(self.session_ok(cseq))], Vec::new()),
             Method::Teardown => {
                 self.state = FlowState::Done;
-                let reply = match &self.session {
-                    Some(session) => build_session_reply(cseq, session),
-                    None => build_plain_ok(cseq),
-                };
+                let reply = self.session_ok(cseq);
                 (
                     vec![Outbound::Bytes(reply), Outbound::Close],
                     vec![FlowEvent::Teardown],
@@ -680,6 +709,14 @@ impl Flow {
                 (vec![Outbound::Bytes(build_plain_ok(cseq))], Vec::new())
             }
             other => self.fail(format!("the sink sent an unexpected {other:?} request")),
+        }
+    }
+
+    /// A 200 naming the session, or a bare 200 before one exists.
+    fn session_ok(&self, cseq: u32) -> Vec<u8> {
+        match &self.session {
+            Some(session) => build_session_reply(cseq, session),
+            None => build_plain_ok(cseq),
         }
     }
 
@@ -718,9 +755,12 @@ impl Flow {
         self.session = Some(session);
         self.rtp_port = Some(rtp_port);
         self.state = FlowState::AwaitingPlay;
-        // The session exists from here, so both timers start now.
         self.last_inbound = Some(now);
         self.last_keep_alive = Some(now);
+        // The reply deadline is re-armed for PLAY, and deliberately is NOT
+        // refreshed by inbound traffic the way liveness is: a sink that has
+        // set up but never plays is stuck, however chatty its keep-alives are,
+        // and the two deadlines are allowed to disagree about that.
         self.awaiting_since = Some(now);
         (vec![Outbound::Bytes(reply)], Vec::new())
     }
@@ -729,14 +769,23 @@ impl Flow {
         let (Some(session), Some(rtp_port)) = (self.session.clone(), self.rtp_port) else {
             return self.fail("the sink sent PLAY before SETUP".to_string());
         };
+        // The destination is announced once. A second PLAY is a sink resuming
+        // after the PAUSE glint advertises, and the caller starts a pipeline
+        // per announcement — a second one would stream twice to one sink.
+        let already_streaming = self.state == FlowState::Streaming;
         self.state = FlowState::Streaming;
         self.awaiting_since = None;
-        (
-            vec![Outbound::Bytes(build_session_reply(cseq, &session))],
+        let events = if already_streaming {
+            Vec::new()
+        } else {
             vec![FlowEvent::Play {
                 rtp_host: self.peer.ip().to_string(),
                 rtp_port,
-            }],
+            }]
+        };
+        (
+            vec![Outbound::Bytes(build_session_reply(cseq, &session))],
+            events,
         )
     }
 
@@ -781,6 +830,13 @@ impl Flow {
         response: &Response<Vec<u8>>,
         now: Duration,
     ) -> (Vec<Outbound>, Vec<FlowEvent>) {
+        // A reply whose body carries no Content-Length arrives here EMPTY:
+        // rtsp-types treats the absent header as zero and leaves the
+        // parameter bytes in the decoder, where they surface as the next
+        // message and fail to parse. So a television that omits it produces an
+        // empty capture and a misdirecting reason, and the real body appears
+        // only in the following escaped dump. Not worked around: no
+        // normalization shim until a real sink shows the need.
         let raw = response.body().to_vec();
         let body = parse_body(&raw);
         let captured = FlowEvent::M3Captured(raw);
@@ -825,20 +881,31 @@ impl Flow {
             Err(error) => return with(captured, self.fail(error.to_string())),
         };
 
-        let sink_audio = match body_value(&body, "wfd_audio_codecs") {
-            Some(value) => match AudioCodecs::parse(value) {
-                Ok(parsed) => parsed,
+        // An unreadable audio line degrades to video-only rather than failing:
+        // a sink glint cannot agree audio with gets a picture anyway, and
+        // reaching that state through malformed text rather than through an
+        // LPCM-only offer does not make it a different situation.
+        let sink_audio = body_value(&body, "wfd_audio_codecs")
+            .and_then(|value| match AudioCodecs::parse(value) {
+                Ok(parsed) => Some(parsed),
                 Err(error) => {
-                    return with(
-                        captured,
-                        self.fail(format!(
-                            "the sink's wfd_audio_codecs is unreadable: {error}"
-                        )),
-                    );
+                    tracing::warn!(%error, "the sink's wfd_audio_codecs is unreadable");
+                    None
                 }
-            },
-            None => AudioCodecs(Vec::new()),
-        };
+            })
+            .unwrap_or_else(|| AudioCodecs(Vec::new()));
+        // Vendor extensions (microsoft_*, intel_*) are normal in a real M3
+        // reply and never an error, but a name glint does not consume is worth
+        // seeing when a television behaves unexpectedly.
+        for (name, _) in &body {
+            if !KNOWN_M3_PARAMETERS
+                .iter()
+                .any(|known| name.eq_ignore_ascii_case(known))
+            {
+                tracing::debug!(%name, "the sink's M3 reply carries a parameter glint does not read");
+            }
+        }
+
         let audio = select_audio(&sink_audio);
         if audio.is_none() {
             tracing::warn!(
@@ -2211,5 +2278,136 @@ Content-Type: text/parameters\r\nContent-Length: {}\r\n\r\n{body}",
                 .iter()
                 .any(|event| matches!(event, FlowEvent::Negotiated { .. }))
         );
+    }
+
+    #[test]
+    fn a_pause_and_the_play_that_resumes_it_both_keep_the_cast_alive() {
+        // glint's own M2 reply advertises PAUSE, so a sink that pauses is
+        // using a method glint told it it could use. Failing on it would tear
+        // down a healthy cast — and so would failing on the PLAY that resumes
+        // it one message later.
+        // arrange
+        let mut flow = at_play();
+        let session = flow.session().expect("the session is armed").to_string();
+
+        // act: the user pauses on the television
+        let (paused_out, paused_events) = flow.on_message(
+            &request("PAUSE rtsp://x/wfd1.0 RTSP/1.0\r\nCSeq: 300\r\nSession: abc\r\n\r\n"),
+            Duration::from_secs(6),
+        );
+        // assert
+        assert_eq!(
+            wire(&paused_out),
+            format!("RTSP/1.0 200 OK\r\nCSeq: 300\r\nSession: {session}\r\n\r\n")
+        );
+        assert!(!closed(&paused_out), "a pause must not close the socket");
+        assert!(paused_events.is_empty(), "a pause is not a teardown");
+
+        // act: and then resumes
+        let (resumed_out, resumed_events) = flow.on_message(
+            &request("PLAY rtsp://x/wfd1.0 RTSP/1.0\r\nCSeq: 301\r\nSession: abc\r\n\r\n"),
+            Duration::from_secs(7),
+        );
+        // assert
+        assert_eq!(
+            wire(&resumed_out),
+            format!("RTSP/1.0 200 OK\r\nCSeq: 301\r\nSession: {session}\r\n\r\n")
+        );
+        assert!(!closed(&resumed_out));
+        assert!(failed(&resumed_events).is_none());
+        assert_eq!(flow.state(), FlowState::Streaming);
+    }
+
+    #[test]
+    fn a_resuming_play_does_not_announce_the_destination_twice() {
+        // A consumer starts its pipeline on FlowEvent::Play. Re-announcing on
+        // the PLAY that resumes a pause would start a second one at the same
+        // destination.
+        // arrange
+        let mut flow = at_play();
+        // act
+        let (_, events) = flow.on_message(
+            &request("PLAY rtsp://x/wfd1.0 RTSP/1.0\r\nCSeq: 301\r\nSession: abc\r\n\r\n"),
+            Duration::from_secs(7),
+        );
+        // assert
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, FlowEvent::Play { .. })),
+            "the destination was announced a second time"
+        );
+    }
+
+    #[test]
+    fn every_method_glint_advertises_is_one_it_will_not_tear_down_over() {
+        // The M2 Public list is a promise. Anything on it that reaches the
+        // unexpected-method arm kills a cast the sink was entitled to expect
+        // would survive. Driven off PUBLIC_METHODS itself, so adding a method
+        // to the advertisement without handling it fails here.
+        let advertised: Vec<&str> = PUBLIC_METHODS
+            .split(',')
+            .map(str::trim)
+            .filter(|token| *token != WFD_PROFILE)
+            .collect();
+        assert!(!advertised.is_empty(), "the Public list parsed to nothing");
+
+        for method in advertised {
+            // arrange: a fresh flow at PLAY for each, since some end the flow
+            let mut flow = at_play();
+            // Each method gets a WELL-FORMED instance: the promise being
+            // pinned is that an advertised method is handled, not that a
+            // malformed one is accepted. A SETUP with no Transport genuinely
+            // has nowhere to send RTP and is right to fail.
+            let raw = match method {
+                "OPTIONS" => "OPTIONS * RTSP/1.0\r\nCSeq: 400\r\n\r\n".to_string(),
+                "SETUP" => "SETUP rtsp://x/wfd1.0/streamid=0 RTSP/1.0\r\nCSeq: 400\r\n\
+Transport: RTP/AVP/UDP;unicast;client_port=19000\r\n\r\n"
+                    .to_string(),
+                _ => format!(
+                    "{method} rtsp://x/wfd1.0 RTSP/1.0\r\nCSeq: 400\r\nSession: abc\r\n\r\n"
+                ),
+            };
+            // act
+            let (out, events) = flow.on_message(&request(&raw), Duration::from_secs(6));
+            // assert
+            let text = wire(&out);
+            assert!(
+                text.starts_with("RTSP/1.0 200 OK\r\n"),
+                "{method} is advertised but was not answered with 200: {text}"
+            );
+            // TEARDOWN is the one advertised method that SHOULD end the flow.
+            if method != "TEARDOWN" {
+                assert!(
+                    failed(&events).is_none(),
+                    "{method} is advertised but failed the flow"
+                );
+                assert!(
+                    !closed(&out),
+                    "{method} is advertised but closed the socket"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_unreadable_audio_line_still_casts_video() {
+        // D34 decided that a sink glint cannot agree audio with gets a
+        // video-only cast rather than a failed handshake. A malformed audio
+        // line is that same situation arriving by a different route, and the
+        // sloppy-value neighbour — wfd_client_rtp_ports — only warns. Failing
+        // here would black-screen a sink over a parameter glint can live
+        // without.
+        // arrange
+        let mut flow = flow();
+        flow.on_tick(PRE_M1_DELAY);
+        flow.on_message(&response(1, ""), Duration::from_secs(1));
+        let broken = SINK_M3_REPLY.replace("AAC 00000007 00", "AAC not-hex 00");
+        // act
+        let (out, events) = flow.on_message(&response(2, &broken), Duration::from_secs(2));
+        // assert
+        assert!(failed(&events).is_none(), "a bad audio line is not fatal");
+        assert!(wire(&out).contains("wfd_audio_codecs: none\r\n"));
+        assert!(!flow.audio_selected());
     }
 }

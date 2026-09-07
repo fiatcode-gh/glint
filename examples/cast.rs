@@ -20,11 +20,12 @@
 //! Gate one — the CU7000 reaches PLAY. Watch the printed lines in order:
 //! `link up`, then `sink connected`, then `negotiated`, then `PLAY`. If it
 //! stops at `link up` the blocker is still follow-up 9. If a sink connects but
-//! the handshake dies, the `flow failed` line names the reason, and any
-//! `PARSE ERROR` line carries the television's own bytes escaped — that dump
-//! is the only instrument for a byte stream nobody has seen, and it is what
-//! decides whether a tolerance shim is ever needed. Do not write one before
-//! that dump says so.
+//! the handshake dies, the `flow failed:` line names the reason — and when the
+//! television's bytes are what rtsp-types rejected, that same line carries
+//! them escaped, reading `the peer sent bytes that are not RTSP: ...`. That
+//! dump is the only instrument for a byte stream nobody has seen, and it is
+//! what decides whether a tolerance shim is ever needed. Do not write one
+//! before that dump says so.
 //!
 //! Gate two — the picture appears. With `PLAY` printed and the stats lines
 //! showing a non-zero `bytes/s`, look at the television: that is

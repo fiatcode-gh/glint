@@ -81,8 +81,18 @@ pub fn build(spec: &PipelineSpec) -> String {
     encoder_args.push(format!("{}={}", p.keyframe, keyframe_frames(spec.fps)));
     encoder_args.extend(p.extra.iter().map(|e| (*e).to_string()));
 
-    // `sync=false async=false` on the sink: a live cast must not block on the
-    // receiver's clock or wait for a preroll it will never get.
+    // Why the RTP tail looks like this, at the site rather than only in the
+    // tests that pin it:
+    // - `alignment=7` on the muxer below: 7 transport packets are 1316 bytes,
+    //   which is the payload size UDP streaming wants — GND's "force the
+    //   correct alignment for UDP".
+    // - no `pt=`: Wi-Fi Display requires the MP2T static assignment 33, which
+    //   is already rtpmp2tpay's default, so naming it would be a second copy
+    //   of the number free to drift from the first.
+    // - `bind-port=16384`: what makes the M6 reply's advertised
+    //   `server_port=16384-16385` honest instead of a port nothing is on.
+    // - `sync=false async=false`: a live cast must not block on the receiver's
+    //   clock or wait for a preroll it will never get.
     let tail = match &spec.output {
         Output::Rtp { host, port } => format!(
             "rtpmp2tpay ! udpsink host={host} port={port} bind-port=16384 \
@@ -359,6 +369,28 @@ sync=false async=false"
         let built = build(&spec(Encoder::VaH264, false));
         // assert
         assert!(!built.contains("pt="), "got: {built}");
+    }
+
+    #[test]
+    fn the_advertised_server_port_is_the_port_udpsink_actually_binds() {
+        // The M6 reply advertises server_port=16384-16385 and this tail binds
+        // 16384; the two live in different modules and both comments assert
+        // they must agree. Nothing pinned them, so either literal could move
+        // and leave glint advertising a port nothing is bound to — the same
+        // defect the RTSP_PORT-versus-WFD_SOURCE_IES test exists to prevent.
+        // act
+        let built = build(&spec(Encoder::VaH264, false));
+        let advertised = crate::wfd::flow::SERVER_PORTS
+            .strip_prefix("server_port=")
+            .expect("SERVER_PORTS names a server_port")
+            .split('-')
+            .next()
+            .expect("the range names a first port");
+        // assert
+        assert!(
+            built.contains(&format!("bind-port={advertised}")),
+            "M6 advertises port {advertised}; the pipeline binds something else: {built}"
+        );
     }
 
     #[test]

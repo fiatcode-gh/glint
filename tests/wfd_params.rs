@@ -207,8 +207,10 @@ fn the_real_sink_reply_fixture_round_trips() {
 #[test]
 fn an_empty_codec_list_formats_without_a_trailing_space() {
     // Unreachable through `parse`, which demands at least one codec entry,
-    // but Task 24 hand-constructs a VideoFormats for the M4 body and a
-    // trailing space would land on the wire.
+    // and the M4 builder always constructs exactly one — so nothing in the
+    // tree reaches this today. It is pinned because `VideoFormats` is public
+    // with public fields, so the empty case is constructible by any caller,
+    // and a trailing space would land on the wire.
     // arrange
     let empty = VideoFormats {
         native: 0,

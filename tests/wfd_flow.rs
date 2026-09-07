@@ -483,3 +483,32 @@ async fn a_sink_that_speaks_no_rtsp_fails_the_flow_instead_of_being_skipped() {
         "the reason should name the parse failure, got: {reason}"
     );
 }
+
+#[tokio::test]
+async fn a_peer_that_never_completes_a_message_is_cut_off() {
+    // rtsp-types trusts the peer's own Content-Length and reports Incomplete
+    // until that many body bytes arrive — measured: a header announcing
+    // 999999999999 yields Incomplete(Some(999999999992)). Without a bound on
+    // what glint will buffer, any host that can reach the listener grows the
+    // decoder's Vec until the process dies. WFD has no authentication.
+    // arrange
+    let (local, mut events) = source().await;
+    let mut sink = Sink::connect(local).await;
+    let (_, _m1) = sink.next_message().await;
+
+    // act: announce a body far larger than any real message, then trickle
+    sink.send("OPTIONS * RTSP/1.0\r\nCSeq: 1\r\nContent-Length: 999999999999\r\n\r\n")
+        .await;
+    for _ in 0..200 {
+        sink.send(&"x".repeat(1024)).await;
+    }
+
+    // assert
+    let FlowEvent::Failed(reason) = next_event(&mut events).await else {
+        panic!("a peer that never completes a message must be cut off");
+    };
+    assert!(
+        reason.contains("without completing a message"),
+        "the reason should name the unfinished message, got: {reason}"
+    );
+}

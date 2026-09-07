@@ -29,13 +29,37 @@ const READ_CHUNK: usize = 4096;
 /// endian) — the two must agree or sinks dial a port nobody answers.
 pub const RTSP_PORT: u16 = 7236;
 
-/// A byte stream the decoder cannot read as RTSP.
+/// The largest part-message glint will hold before giving up on a peer.
+///
+/// `Message::parse` trusts the peer's own `Content-Length` and reports
+/// `Incomplete` until that many body bytes arrive — measured: a header
+/// announcing 999999999999 yields `Incomplete(Some(999999999992))`. Without
+/// this bound, any host that can reach the listener announces a huge body,
+/// trickles bytes, and grows the buffer until the process dies; Wi-Fi Display
+/// has no authentication, so reachable means anyone on the group. A WFD
+/// control message is a few hundred bytes, so this is far past legitimate.
+const MAX_BUFFERED: usize = 64 * 1024;
+
+/// How much of an offending line reaches a log.
+///
+/// The peer chooses the line's length, and a flood with no line ending at all
+/// makes the "first line" the entire buffer — so the dump has to be bounded
+/// here rather than by the peer's punctuation. Long enough to identify what a
+/// television actually sent.
+const ESCAPE_LIMIT: usize = 200;
+
+/// A byte stream the decoder will not go on reading.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("the peer sent bytes that are not RTSP: {escaped}")]
-pub struct FrameError {
-    /// The offending line, escaped so a control byte in it cannot corrupt the
-    /// log that exists to diagnose it.
-    pub escaped: String,
+pub enum FrameError {
+    /// The bytes are not RTSP at all. Carries the offending line, escaped so
+    /// a control byte in it cannot corrupt the log that exists to diagnose it.
+    #[error("the peer sent bytes that are not RTSP: {escaped}")]
+    NotRtsp { escaped: String },
+    /// The peer keeps sending without ever completing a message.
+    #[error(
+        "the peer sent {buffered} bytes without completing a message, over the {max}-byte limit"
+    )]
+    TooLarge { buffered: usize, max: usize },
 }
 
 /// Bytes in, RTSP messages out.
@@ -65,17 +89,25 @@ impl FrameDecoder {
                 self.buffer.drain(..consumed);
                 Ok(Some(message))
             }
+            Err(ParseError::Incomplete(_)) if self.buffer.len() > MAX_BUFFERED => {
+                Err(FrameError::TooLarge {
+                    buffered: self.buffer.len(),
+                    max: MAX_BUFFERED,
+                })
+            }
             Err(ParseError::Incomplete(_)) => Ok(None),
-            Err(ParseError::Error) => Err(FrameError {
-                escaped: self
-                    .buffer
-                    .split(|byte| *byte == b'\n')
-                    .next()
-                    .map(|line| String::from_utf8_lossy(line).escape_debug().to_string())
-                    .unwrap_or_default(),
+            Err(ParseError::Error) => Err(FrameError::NotRtsp {
+                escaped: escape_first_line(&self.buffer),
             }),
         }
     }
+}
+
+/// The first line of a byte stream, bounded and escaped, for a log.
+fn escape_first_line(buffer: &[u8]) -> String {
+    let line = buffer.split(|byte| *byte == b'\n').next().unwrap_or(buffer);
+    let bounded = &line[..line.len().min(ESCAPE_LIMIT)];
+    String::from_utf8_lossy(bounded).escape_debug().to_string()
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -112,14 +144,30 @@ impl RtspListener {
     pub async fn serve(&self, events: mpsc::Sender<FlowEvent>) -> Result<(), RtspError> {
         let mut sessions = 0u64;
         loop {
-            let (stream, peer) = self.inner.accept().await?;
+            // One odd connection must not stop glint listening: an accept that
+            // fails is usually transient (a descriptor limit, a peer gone
+            // between SYN and accept), and propagating it would end the
+            // listener for the rest of the run.
+            let (stream, peer) = match self.inner.accept().await {
+                Ok(accepted) => accepted,
+                Err(error) => {
+                    tracing::warn!(%error, "could not accept a connection");
+                    continue;
+                }
+            };
             sessions += 1;
-            let local = stream.local_addr()?;
+            let local = match stream.local_addr() {
+                Ok(local) => local,
+                Err(error) => {
+                    tracing::warn!(%peer, %error, "could not read the accepted socket's own address");
+                    continue;
+                }
+            };
             tracing::info!(%peer, "a sink connected");
 
             let outcome = tokio::select! {
                 served = drive(stream, local, peer, session_seed(sessions), &events) => served,
-                turned_away = self.turn_away_extras() => turned_away,
+                never = self.turn_away_extras() => never,
             };
             if let Err(error) = outcome {
                 tracing::warn!(%peer, %error, "the RTSP session ended in an error");
@@ -128,26 +176,35 @@ impl RtspListener {
     }
 
     /// Close every further connection for as long as one sink is being served.
-    /// Only ever returns by failing, so it never wins the race against the
-    /// session it is protecting.
-    async fn turn_away_extras(&self) -> Result<(), RtspError> {
+    ///
+    /// Never returns, which is what keeps it from ever winning the `select!`
+    /// against the session it exists to protect. An earlier version returned
+    /// its accept error, and that made it win by FAILING: one `EMFILE` while a
+    /// cast was streaming dropped the healthy session mid-stream.
+    async fn turn_away_extras(&self) -> ! {
         loop {
-            let (extra, peer) = self.inner.accept().await?;
-            tracing::warn!(
-                %peer,
-                "a second sink connected while one is already being served; closing it"
-            );
-            drop(extra);
+            match self.inner.accept().await {
+                Ok((extra, peer)) => {
+                    tracing::warn!(
+                        %peer,
+                        "a second sink connected while one is already being served; closing it"
+                    );
+                    drop(extra);
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "could not accept while turning away extra sinks");
+                }
+            }
         }
     }
 }
 
 /// A seed no two sessions share.
 ///
-/// The wall clock gives a fresh value per run and the counter separates
-/// sessions within one run. A clock before the epoch costs only the id's
-/// unpredictability — the counter still keeps two sessions apart — so it falls
-/// back rather than failing a cast over it.
+/// The clock is read per session, so it already separates them; the counter is
+/// what still does so if the clock is unavailable. A clock before the epoch
+/// costs only the id's unpredictability, never correctness, so it falls back
+/// rather than failing a cast over it.
 fn session_seed(counter: u64) -> u64 {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -176,15 +233,27 @@ async fn drive(
 
     loop {
         let (out, produced) = tokio::select! {
-            read = stream.read(&mut buffer) => match read? {
-                0 => {
+            read = stream.read(&mut buffer) => match read {
+                Ok(0) => {
                     tracing::info!(%peer, "the sink hung up");
                     emit(events, flow.on_hangup()).await;
                     return Ok(());
                 }
-                count => {
+                Ok(count) => {
                     decoder.push(&buffer[..count]);
                     consume(&mut decoder, &mut flow, started.elapsed())
+                }
+                // A read error is the session ending, not the driver quietly
+                // giving up. Returning the error here instead would tell the
+                // caller nothing, and the caller is holding a live pipeline
+                // open on the strength of FlowEvent::Play — a television that
+                // aborts with an RST rather than a FIN is the common case, and
+                // only an event can stop the cast.
+                Err(error) => {
+                    tracing::warn!(%peer, %error, "the RTSP socket could not be read");
+                    let (_, produced) = flow.abort(format!("the RTSP socket failed: {error}"));
+                    emit(events, produced).await;
+                    return Ok(());
                 }
             },
             _ = ticker.tick() => flow.on_tick(started.elapsed()),
@@ -192,9 +261,18 @@ async fn drive(
 
         // Bytes before events: a 200 to TEARDOWN has to reach the sink before
         // anything acts on the teardown and closes the socket.
+        //
+        // A write that fails is logged and does NOT end the flow: a keep-alive
+        // send failure is explicitly non-fatal, and the liveness deadline is
+        // the only judge of whether the sink is gone. If the socket really is
+        // dead the next read says so, and that path ends the flow with an
+        // event rather than in silence.
         for item in &out {
-            if let Outbound::Bytes(bytes) = item {
-                stream.write_all(bytes).await?;
+            if let Outbound::Bytes(bytes) = item
+                && let Err(error) = stream.write_all(bytes).await
+            {
+                tracing::warn!(%peer, %error, "could not write to the sink");
+                break;
             }
         }
         if !emit(events, produced).await {
@@ -260,8 +338,7 @@ mod tests {
     fn the_advertised_control_port_is_the_port_we_listen_on() {
         // The information elements tell a sink where to dial; the listener
         // decides who answers. The two must agree or sinks dial a port nobody
-        // is on. This is the first code tying the link layer's advertisement
-        // to the transport's behaviour.
+        // is on.
         // act
         let advertised = u16::from_be_bytes([WFD_SOURCE_IES[5], WFD_SOURCE_IES[6]]);
         // assert
@@ -344,8 +421,11 @@ Content-Type: text/parameters\r\nContent-Length: 19\r\n\r\nwfd_video_formats\r\n
         // act
         let error = decoder.next().expect_err("a malformed line is an error");
         // assert
-        assert!(error.escaped.contains("NOT RTSP AT ALL"), "got: {error}");
-        assert!(error.escaped.contains("\\u{1}"), "got: {error}");
+        let FrameError::NotRtsp { escaped } = &error else {
+            panic!("expected NotRtsp, got {error:?}");
+        };
+        assert!(escaped.contains("NOT RTSP AT ALL"), "got: {error}");
+        assert!(escaped.contains("\\u{1}"), "got: {error}");
     }
 
     #[test]
@@ -358,8 +438,58 @@ Content-Type: text/parameters\r\nContent-Length: 19\r\n\r\nwfd_video_formats\r\n
         // act
         let error = decoder.next().expect_err("a malformed line is an error");
         // assert
-        assert!(error.escaped.contains("garbage one"), "got: {error}");
-        assert!(!error.escaped.contains("garbage two"), "got: {error}");
+        let FrameError::NotRtsp { escaped } = &error else {
+            panic!("expected NotRtsp, got {error:?}");
+        };
+        assert!(escaped.contains("garbage one"), "got: {error}");
+        assert!(!escaped.contains("garbage two"), "got: {error}");
+    }
+
+    #[test]
+    fn the_logged_dump_is_bounded_when_the_offending_line_is_huge() {
+        // The sibling test above uses two short lines, so the peer's own
+        // newline did the bounding and the assertion never exercised the
+        // bound the test's name claims — it passed for the wrong reason. The
+        // peer chooses the line length, so the dump has to be bounded here.
+        // arrange: one malformed line of 8 KiB, terminated so it parses as an
+        // error rather than as a message still arriving
+        let mut decoder = FrameDecoder::default();
+        let mut flood = vec![b'!'; 8192];
+        flood.extend_from_slice(b"\r\n");
+        decoder.push(&flood);
+        // act
+        let error = decoder.next().expect_err("a malformed line is an error");
+        // assert
+        let FrameError::NotRtsp { escaped } = &error else {
+            panic!("expected NotRtsp, got {error:?}");
+        };
+        assert!(
+            escaped.len() <= ESCAPE_LIMIT,
+            "the dump grew to {} bytes with the peer choosing the length",
+            escaped.len()
+        );
+    }
+
+    #[test]
+    fn a_peer_that_never_completes_a_message_is_refused_at_the_cap() {
+        // rtsp-types trusts the peer's own Content-Length and reports
+        // Incomplete until the body arrives, so without this cap a peer that
+        // announces a huge body and trickles bytes grows the buffer until the
+        // process dies.
+        // arrange
+        let mut decoder = FrameDecoder::default();
+        decoder.push(b"OPTIONS * RTSP/1.0\r\nCSeq: 1\r\nContent-Length: 999999999999\r\n\r\n");
+        // act: under the cap it is still merely incomplete
+        assert!(decoder.next().unwrap().is_none());
+        decoder.push(&vec![b'x'; MAX_BUFFERED]);
+        // assert
+        let error = decoder
+            .next()
+            .expect_err("past the cap the peer is refused");
+        assert!(
+            matches!(error, FrameError::TooLarge { .. }),
+            "expected TooLarge, got {error:?}"
+        );
     }
 
     #[test]
