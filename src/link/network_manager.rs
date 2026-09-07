@@ -515,9 +515,11 @@ impl P2pLink for NetworkManagerLink {
         let peer_path =
             resolve_peer_path(&visible, peer.mac).ok_or(LinkError::PeerUnreachable(peer.mac))?;
 
-        // The peer travels in `specific_object` rather than in the
-        // profile's `wifi-p2p.peer` field: that is what GND's field-proven
-        // code does, contradicting the man page's "only way" wording.
+        // The peer is named twice on purpose: here as `specific_object`,
+        // which is what GND does, and again in the profile's
+        // `wifi-p2p.peer` field, which the man page calls the only way to
+        // join a group. `connection_settings` carries the measurement
+        // behind that; it is not repeated here.
         // `bind-activation` plus `persist = volatile` make NetworkManager
         // drop the connection when glint's own bus connection dies.
         let (_profile, activation, _result) = ManagerProxy::new(&self.connection)
