@@ -36,6 +36,9 @@ impl GroupId {
         GroupId(id.into())
     }
 
+    /// The link layer needs its own id back to act on it: NetworkManager's
+    /// implementation carries a D-Bus object path here and cannot delete
+    /// the connection without reading it out again.
     pub fn as_str(&self) -> &str {
         &self.0
     }

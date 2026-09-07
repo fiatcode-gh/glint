@@ -16,6 +16,13 @@ use crate::receiver::MacAddr;
 /// never hard-coded.
 const DEVICE_TYPE_WIFI_P2P: u32 = 30;
 
+/// NetworkManager's device state for a fully activated device.
+///
+/// Public because the difference between "NetworkManager accepted the
+/// activation" and "the link is actually up" is invisible otherwise, and a
+/// caller that reports the first as the second is lying.
+pub const DEVICE_STATE_ACTIVATED: u32 = 100;
+
 /// How long a `scan` collects peers. NetworkManager's own find times out
 /// at 30 seconds by default, so the window sits well under it and the find
 /// then lapses on its own.
@@ -52,6 +59,9 @@ trait Manager {
 trait Device {
     #[zbus(property)]
     fn device_type(&self) -> zbus::Result<u32>;
+
+    #[zbus(property)]
+    fn state(&self) -> zbus::Result<u32>;
 }
 
 /// `StopFind` is deliberately absent. GND's own FIXME records that calling
@@ -119,12 +129,9 @@ trait SettingsConnection {
 /// 0x00c8 = 200.
 const WFD_SOURCE_IES: [u8; 9] = [0x00, 0x00, 0x06, 0x00, 0x90, 0x1c, 0x44, 0x00, 0xc8];
 
-/// A peer's three properties as NetworkManager reports them, before glint
-/// has decided whether the peer is a Wi-Fi Display sink at all.
-///
-/// Public only so `advertised_peers` can hand it to a diagnostic caller.
-/// `Peer` is what the link layer promises callers; this is the wire truth
-/// behind it, and it is not the place to add capability fields.
+/// A peer as NetworkManager reports it, before glint has decided whether it
+/// is a Wi-Fi Display sink at all. `Peer` is what the link layer promises
+/// callers; this is the wire truth behind it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawPeer {
     pub name: String,
@@ -161,12 +168,14 @@ fn resolve_peer_path<P: Clone>(peers: &[(String, P)], mac: MacAddr) -> Option<P>
 /// startup cleanup filters on it, so the two can never drift apart.
 const GLINT_CONNECTION_PREFIX: &str = "glint p2p ";
 
-/// NetworkManager's `a{sa{sv}}` connection profile. Built by a pure
-/// function so its structure is testable without a bus, which matters
-/// because a wrong variant type here fails only against a live
-/// NetworkManager.
+/// NetworkManager's `a{sa{sv}}` connection profile. One name binds the
+/// proxy parameter and the builder's return on purpose: zbus derives the
+/// D-Bus signature from the parameter type, so drift between the two would
+/// fail only against a live NetworkManager.
 type ConnectionSettings = HashMap<&'static str, HashMap<&'static str, Value<'static>>>;
 
+/// Pure, so the profile's structure is testable without a bus.
+///
 /// Naming the connection after its peer is deliberate belt and braces
 /// against the volatile, bus-bound activation that connect asks for:
 /// NetworkManager drops the connection when glint's D-Bus connection dies,
@@ -183,7 +192,18 @@ fn connection_settings(mac: MacAddr, ies: &[u8]) -> ConnectionSettings {
         ),
         (
             "wifi-p2p",
-            HashMap::from([("wfd-ies", Value::from(ies.to_vec()))]),
+            HashMap::from([
+                ("wfd-ies", Value::from(ies.to_vec())),
+                // Named here as well as passed as `specific_object`, because
+                // specific_object alone was measured to be insufficient: on
+                // NetworkManager 1.56.1 the device entered `config` and sat
+                // there for thirty seconds with the supplicant logging no
+                // group negotiation at all. That matches the man page's
+                // wording, that this property is "the only way to create or
+                // join a group". Why GND connects without it is unexplained;
+                // glint sets both rather than depend on the answer.
+                ("peer", Value::from(mac.to_string())),
+            ]),
         ),
         (
             "ipv4",
@@ -211,6 +231,33 @@ fn stale_connection_paths<P: Clone>(connections: &[(String, P)]) -> Vec<P> {
         .filter(|(id, _)| id.starts_with(GLINT_CONNECTION_PREFIX))
         .map(|(_, path)| path.clone())
         .collect()
+}
+
+/// A removal that finds nothing to remove has reached the end state it
+/// wanted, so these count as success rather than failure.
+///
+/// NetworkManager answers a request against a connection object that is not
+/// there with `UnknownMethod` — its path check runs before method dispatch —
+/// so that name has to be accepted, and the other two are its siblings for
+/// a vanished object. The cost of that breadth is worth stating: a
+/// well-formed path naming some OTHER live object answers the same way, so
+/// this tells "gone" from "never valid" but not from "wrong object".
+fn already_gone(error_name: &str) -> bool {
+    matches!(
+        error_name,
+        "org.freedesktop.DBus.Error.UnknownObject"
+            | "org.freedesktop.DBus.Error.UnknownMethod"
+            | "org.freedesktop.DBus.Error.UnknownInterface"
+    )
+}
+
+/// `None` covers a missing key and a non-string value alike, because a
+/// profile glint cannot name is certainly not a profile glint created.
+fn connection_id(sections: &HashMap<String, HashMap<String, OwnedValue>>) -> Option<String> {
+    sections
+        .get("connection")
+        .and_then(|section| section.get("id"))
+        .and_then(|id| String::try_from(id.clone()).ok())
 }
 
 pub struct NetworkManagerLink {
@@ -298,18 +345,33 @@ impl NetworkManagerLink {
         LinkHandle::new(*next)
     }
 
-    /// Reads the peers NetworkManager currently lists without starting a
-    /// find of its own, so a caller that has just scanned can see what was
-    /// advertised without paying for a second window.
+    /// NetworkManager's current state for the P2P device, to be compared
+    /// against `DEVICE_STATE_ACTIVATED`.
     ///
-    /// This exists for diagnostics and for the examples, and for nothing
-    /// else. `Peer` is the trait's public currency and stays that way:
-    /// `scan` is what callers are meant to use, and it returns `Peer`.
-    /// What this adds is the raw information-element bytes, which `Peer`
-    /// deliberately has no field for and which are the only way to tell a
-    /// sink that answered from a neighbour dropped for advertising none.
-    /// Do not grow an API on `RawPeer` — capability fields belong on
-    /// `Peer`, where the session logic can reach them.
+    /// `connect` returning a handle means only that NetworkManager accepted
+    /// the activation. Group negotiation happens afterwards and can stall
+    /// there indefinitely without raising any error at all, so this is the
+    /// only way a caller can find out whether the link came up.
+    pub async fn device_state(&self) -> Result<u32, LinkError> {
+        DeviceProxy::builder(&self.connection)
+            .path(&self.device_path)
+            .map_err(backend)?
+            .build()
+            .await
+            .map_err(backend)?
+            .state()
+            .await
+            .map_err(backend)
+    }
+
+    /// Starts no find of its own, so a caller that has just scanned pays no
+    /// second window.
+    ///
+    /// Public for diagnostics and the examples only: it exposes the raw
+    /// information-element bytes that `Peer` deliberately has no field for,
+    /// and those are the only way to tell a sink that answered from a
+    /// neighbour dropped for advertising none. Do not grow an API on
+    /// `RawPeer` — capability fields belong on `Peer`.
     pub async fn advertised_peers(&self) -> Result<Vec<RawPeer>, LinkError> {
         let device = self.device().await?;
         let mut seen = Vec::new();
@@ -329,12 +391,11 @@ impl P2pLink for NetworkManagerLink {
     async fn scan(&self) -> Result<Vec<Peer>, LinkError> {
         let device = self.device().await?;
         device.start_find(HashMap::new()).await.map_err(backend)?;
-        // Sleep the whole window and read `Peers` once at the end, rather
-        // than polling and returning early on the first hit: NetworkManager
-        // accumulates peers for as long as the find runs, so one late read
-        // sees everything a poll loop would have, and every sink gets the
-        // full window to answer. An early-return loop is the tempting
-        // "optimization" here and it can return before the TV has replied.
+        // NetworkManager accumulates peers for as long as the find runs, so
+        // one read at the end sees everything a poll loop would have, and
+        // every sink gets the whole window to answer. An early-return loop
+        // is the tempting "optimization" here, and it can return before the
+        // TV has replied.
         tokio::time::sleep(SCAN_WINDOW).await;
         Ok(wfd_peers(&self.advertised_peers().await?))
     }
@@ -386,14 +447,22 @@ impl P2pLink for NetworkManagerLink {
     /// leaves any unrelated activation on the same device alone.
     async fn disconnect(&self, handle: LinkHandle) -> Result<(), LinkError> {
         let activation = lock(&self.activations)
-            .remove(&handle)
+            .get(&handle)
+            .cloned()
             .ok_or_else(|| LinkError::Backend("unknown link handle".to_string()))?;
         ManagerProxy::new(&self.connection)
             .await
             .map_err(backend)?
             .deactivate_connection(&activation.as_ref())
             .await
-            .map_err(backend)
+            .map_err(backend)?;
+        // Forgotten only once the deactivation succeeded. Dropping it first
+        // would turn a transient D-Bus failure into a permanently
+        // unreachable activation: the retry would answer "unknown link
+        // handle" instead of the real error, and nothing would hold the
+        // path any more.
+        lock(&self.activations).remove(&handle);
+        Ok(())
     }
 
     /// Filters by id prefix rather than by liveness: whether an active
@@ -411,12 +480,15 @@ impl P2pLink for NetworkManagerLink {
                 .get_settings()
                 .await
                 .map_err(backend)?;
-            let id = sections
-                .get("connection")
-                .and_then(|section| section.get("id"))
-                .and_then(|id| String::try_from(id.clone()).ok());
-            if let Some(id) = id {
-                named.push((id, path));
+            match connection_id(&sections) {
+                Some(id) => named.push((id, path)),
+                // Skipping is right, but silence is not: if reading ids ever
+                // broke wholesale, cleanup would report a tidy zero forever
+                // and nobody would know it had stopped working.
+                None => tracing::warn!(
+                    connection = %path.as_str(),
+                    "skipping a NetworkManager connection with no readable connection.id"
+                ),
             }
         }
         Ok(stale_connection_paths(&named)
@@ -426,23 +498,13 @@ impl P2pLink for NetworkManagerLink {
     }
 
     async fn remove_group(&self, id: GroupId) -> Result<(), LinkError> {
+        // A syntactically invalid id is reported rather than swallowed: it
+        // names nothing that could ever have existed, so treating it as
+        // "already gone" would hide a caller's bug.
         let path = OwnedObjectPath::try_from(id.as_str()).map_err(backend)?;
         match self.profile(path).await?.delete().await {
             Ok(()) => Ok(()),
-            // A profile that has already gone is the desired end state, so
-            // a repeated removal is not an error. A malformed id is still
-            // reported: it names nothing that ever existed, and swallowing
-            // it would hide a caller's bug.
-            Err(zbus::Error::MethodError(name, _, _))
-                if matches!(
-                    name.as_str(),
-                    "org.freedesktop.DBus.Error.UnknownObject"
-                        | "org.freedesktop.DBus.Error.UnknownMethod"
-                        | "org.freedesktop.DBus.Error.UnknownInterface"
-                ) =>
-            {
-                Ok(())
-            }
+            Err(zbus::Error::MethodError(name, _, _)) if already_gone(name.as_str()) => Ok(()),
             Err(error) => Err(backend(error)),
         }
     }
@@ -459,6 +521,18 @@ mod tests {
             hw_address: hw_address.to_string(),
             wfd_ies: advertised,
         }
+    }
+
+    fn profile_with(
+        section: &str,
+        key: &str,
+        value: Value<'static>,
+    ) -> HashMap<String, HashMap<String, OwnedValue>> {
+        let entry = OwnedValue::try_from(value).expect("a test value must convert");
+        HashMap::from([(
+            section.to_string(),
+            HashMap::from([(key.to_string(), entry)]),
+        )])
     }
 
     fn peer(mac: &str, name: &str) -> Peer {
@@ -536,14 +610,15 @@ mod tests {
 
     #[test]
     fn connection_settings_names_the_connection_after_its_peer() {
-        // arrange
         let cases = [
             ("aa:bb:cc:dd:ee:ff", "glint p2p aa:bb:cc:dd:ee:ff"),
             ("00:11:22:33:44:55", "glint p2p 00:11:22:33:44:55"),
         ];
-        for (mac, expected_id) in cases {
+        for (text, expected_id) in cases {
+            // arrange
+            let mac: MacAddr = text.parse().unwrap();
             // act
-            let settings = connection_settings(mac.parse().unwrap(), &WFD_SOURCE_IES);
+            let settings = connection_settings(mac, &WFD_SOURCE_IES);
             // assert
             assert_eq!(
                 settings["connection"]["id"],
@@ -551,6 +626,81 @@ mod tests {
                 "id for {mac}"
             );
         }
+    }
+
+    #[test]
+    fn connection_settings_names_the_peer_to_negotiate_with() {
+        // arrange
+        let mac = "aa:bb:cc:dd:ee:ff".parse().unwrap();
+        // act
+        let settings = connection_settings(mac, &WFD_SOURCE_IES);
+        // assert
+        assert_eq!(
+            settings["wifi-p2p"]["peer"],
+            Value::from("aa:bb:cc:dd:ee:ff")
+        );
+    }
+
+    #[test]
+    fn a_vanished_connection_object_counts_as_already_removed() {
+        // arrange
+        let vanished = [
+            "org.freedesktop.DBus.Error.UnknownObject",
+            "org.freedesktop.DBus.Error.UnknownMethod",
+            "org.freedesktop.DBus.Error.UnknownInterface",
+        ];
+        // act, assert
+        for name in vanished {
+            assert!(already_gone(name), "{name} must count as already gone");
+        }
+    }
+
+    #[test]
+    fn a_real_removal_failure_is_not_swallowed() {
+        // arrange
+        let failures = [
+            "org.freedesktop.NetworkManager.Settings.Connection.FailedToDelete",
+            "org.freedesktop.DBus.Error.AccessDenied",
+            "org.freedesktop.DBus.Error.NoReply",
+            "",
+        ];
+        // act, assert
+        for name in failures {
+            assert!(
+                !already_gone(name),
+                "{name} must be reported, not swallowed"
+            );
+        }
+    }
+
+    #[test]
+    fn the_connection_id_is_read_out_of_the_connection_section() {
+        // arrange
+        let profile = profile_with(
+            "connection",
+            "id",
+            Value::from("glint p2p aa:bb:cc:dd:ee:ff"),
+        );
+        // act
+        let id = connection_id(&profile);
+        // assert
+        assert_eq!(id.as_deref(), Some("glint p2p aa:bb:cc:dd:ee:ff"));
+    }
+
+    #[test]
+    fn a_profile_carrying_no_id_is_skipped_rather_than_failing() {
+        // arrange
+        let profile = profile_with("connection", "uuid", Value::from("b57d0931-2aca"));
+        // act, assert
+        assert_eq!(connection_id(&profile), None);
+    }
+
+    #[test]
+    fn an_id_that_is_not_a_string_is_skipped() {
+        // arrange
+        let profile = profile_with("connection", "id", Value::from(7u32));
+        // act, assert
+        assert_eq!(connection_id(&profile), None);
     }
 
     #[test]
@@ -578,8 +728,12 @@ mod tests {
             .expect("wfd-ies must be present");
         assert!(
             matches!(ies, Value::Array(bytes) if !bytes.is_empty()),
-            "wfd-ies must be a non-empty byte array, got {ies:?}"
+            "wfd-ies must be a non-empty array, got {ies:?}"
         );
+        // Pins the element type without pinning the bytes: a map that sent
+        // these as anything but a byte array would satisfy NetworkManager's
+        // schema nowhere and fail only against a live bus.
+        assert_eq!(ies.value_signature().to_string(), "ay");
     }
 
     #[test]
@@ -626,7 +780,6 @@ mod tests {
         // The sole oracle for the bytes: every other test asserts only that
         // the field is wired in, so flipping a byte here reddens this test
         // and nothing else.
-        // arrange, act, assert
         assert_eq!(
             WFD_SOURCE_IES,
             [0x00, 0x00, 0x06, 0x00, 0x90, 0x1c, 0x44, 0x00, 0xc8]
