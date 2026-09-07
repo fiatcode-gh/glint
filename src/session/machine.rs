@@ -42,6 +42,12 @@ fn with_signal(next: State, mut actions: Vec<Action>) -> (State, Vec<Action>) {
 /// which arrives later as its own `StreamStarted` event. Calling the state
 /// `Streaming` in between would be a lie the D-Bus signal would repeat.
 ///
+/// `NegotiationFailed` returns to `Idle` and tears the link down rather than
+/// entering `Reconnecting`: the link is healthy, so retrying the same
+/// activation would re-run a handshake that has already been refused on its
+/// own terms. An HDCP demand or a disjoint format set does not become
+/// satisfiable by dialling again.
+///
 /// `Pairing + PinEntered` re-issues `StartLink` rather than a distinct
 /// "resume" verb. With the NetworkManager P2P path the two are the same call —
 /// activation stalls waiting on a secret, and supplying it re-drives the same
@@ -62,6 +68,7 @@ pub fn step(state: State, event: Event) -> Result<(State, Vec<Action>), InvalidT
         (Pairing, PinEntered) => (Connecting, vec![StartLink]),
         (Connecting, LinkFailed) | (Pairing, LinkFailed) => (Idle, vec![TearDownLink]),
         (Negotiating, NegotiationDone) => (Negotiating, vec![StartPipeline]),
+        (Negotiating, NegotiationFailed) => (Idle, vec![TearDownLink]),
         (Negotiating, StreamStarted) => (Streaming, vec![]),
         (Negotiating, LinkLost) | (Streaming, LinkLost) => {
             (Reconnecting, vec![StopPipeline, ScheduleRetry])
