@@ -6,6 +6,7 @@
 
 pub mod build;
 pub mod encoder;
+pub mod runner;
 
 use serde::{Deserialize, Serialize};
 
