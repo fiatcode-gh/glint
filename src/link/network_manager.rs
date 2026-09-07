@@ -180,6 +180,10 @@ fn resolve_peer_path<P: Clone>(peers: &[(String, P)], mac: MacAddr) -> Option<P>
         .map(|(_, path)| path.clone())
 }
 
+/// NetworkManager's `NMSettingWirelessSecurityWpsMethod` flag for
+/// push-button pairing.
+const WPS_METHOD_PBC: u32 = 0x4;
+
 /// The one prefix both readers use: connect names a connection with it and
 /// startup cleanup filters on it, so the two can never drift apart.
 const GLINT_CONNECTION_PREFIX: &str = "glint p2p ";
@@ -219,16 +223,21 @@ fn connection_settings(mac: MacAddr, ies: &[u8]) -> ConnectionSettings {
                 // join a group". Why GND connects without it is unexplained;
                 // glint sets both rather than depend on the answer.
                 ("peer", Value::from(mac.to_string())),
-                // Push-button, stated rather than left to `auto` (0).
-                // Measured: with auto, NetworkManager sat in `config` twice
-                // over while wpa_supplicant logged no group negotiation at
-                // all, which is what a stage with no WPS method to drive
-                // looks like from outside. The sink advertises push-button
-                // among its config methods (0x188), so this is a method it
-                // will actually answer. A u32, not a string — NetworkManager
-                // is strict and a wrong variant type here fails only
-                // against a live bus.
-                ("wps-method", Value::from(1u32)),
+                // Push-button, stated rather than left unset. This is a
+                // FLAGS field, not an ordinal, and the flag values are
+                // measured from `man nm-settings-nmcli` on the host:
+                // default 0x0, disabled 0x1, auto 0x2, pbc 0x4, pin 0x8.
+                // So 0x4 is push-button; 0x1 is DISABLED, which NM rejects
+                // outright for wifi-p2p with "WPS is required".
+                //
+                // Worth knowing why this is set at all: leaving the field
+                // out gives `default` (0x0), which is a distinct flag from
+                // `auto` (0x2), and with it NetworkManager sat in `config`
+                // twice over while wpa_supplicant logged no group
+                // negotiation whatsoever. The sink advertises push-button
+                // among its config methods (0x188), so it is a method the
+                // TV will answer.
+                ("wps-method", Value::from(WPS_METHOD_PBC)),
             ]),
         ),
         (
@@ -725,7 +734,10 @@ mod tests {
         // act
         let settings = connection_settings(mac, &WFD_SOURCE_IES);
         // assert
-        assert_eq!(settings["wifi-p2p"]["wps-method"], Value::from(1u32));
+        // Pinned to the literal flag, not to the constant: 0x1 is DISABLED,
+        // which NetworkManager rejects for wifi-p2p, so the exact value is
+        // the whole point of this row.
+        assert_eq!(settings["wifi-p2p"]["wps-method"], Value::from(0x4u32));
     }
 
     #[test]
