@@ -219,6 +219,16 @@ fn connection_settings(mac: MacAddr, ies: &[u8]) -> ConnectionSettings {
                 // join a group". Why GND connects without it is unexplained;
                 // glint sets both rather than depend on the answer.
                 ("peer", Value::from(mac.to_string())),
+                // Push-button, stated rather than left to `auto` (0).
+                // Measured: with auto, NetworkManager sat in `config` twice
+                // over while wpa_supplicant logged no group negotiation at
+                // all, which is what a stage with no WPS method to drive
+                // looks like from outside. The sink advertises push-button
+                // among its config methods (0x188), so this is a method it
+                // will actually answer. A u32, not a string — NetworkManager
+                // is strict and a wrong variant type here fails only
+                // against a live bus.
+                ("wps-method", Value::from(1u32)),
             ]),
         ),
         (
@@ -706,6 +716,16 @@ mod tests {
             settings["wifi-p2p"]["peer"],
             Value::from("aa:bb:cc:dd:ee:ff")
         );
+    }
+
+    #[test]
+    fn connection_settings_asks_for_push_button_pairing() {
+        // arrange
+        let mac = "aa:bb:cc:dd:ee:ff".parse().unwrap();
+        // act
+        let settings = connection_settings(mac, &WFD_SOURCE_IES);
+        // assert
+        assert_eq!(settings["wifi-p2p"]["wps-method"], Value::from(1u32));
     }
 
     #[test]

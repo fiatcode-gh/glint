@@ -79,9 +79,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("                   (100 is activated; 50 is `config`, still negotiating)");
     }
 
+    // No state printed here on purpose: a read taken straight after
+    // deactivation catches NetworkManager mid-teardown, and reporting that
+    // transient as the outcome is how the earlier "connected: yes" lie
+    // worked. `nmcli device` in the banner is the settled answer.
     link.disconnect(handle).await?;
     println!("deactivated:       yes");
-    println!("final state:       {}", link.device_state().await?);
     println!();
     println!("--- `nmcli device` must show the wifi-p2p device disconnected ---");
     println!("--- `nmcli connection show` must list no `glint p2p ...` leftover ---");
