@@ -14,7 +14,9 @@
 
 use std::net::SocketAddr;
 
-use rtsp_types::{Message, Method, Request, Url, Version, headers};
+use rtsp_types::{
+    Message, Method, Request, Response, ResponseBuilder, StatusCode, Url, Version, headers,
+};
 
 use crate::wfd::modes::{Table, bit_for_mode};
 use crate::wfd::negotiate::{ChosenFormat, H264Profile};
@@ -154,6 +156,82 @@ pub fn build_m16(cseq: u32, session: &str) -> Vec<u8> {
             .request_uri(wfd_uri())
             .header(headers::CSEQ, cseq.to_string())
             .header(headers::SESSION, session)
+            .build(Vec::new()),
+    ))
+}
+
+/// The methods glint answers, with the WFD profile token first — GND prepends
+/// exactly this, and the sink reads the list to decide what it may send.
+const PUBLIC_METHODS: &str =
+    "org.wfa.wfd1.0, OPTIONS, GET_PARAMETER, SET_PARAMETER, SETUP, PLAY, PAUSE, TEARDOWN";
+
+/// The RTP and RTCP ports glint's udpsink binds, quoted back in the M6 reply
+/// so the advertisement matches the pipeline's own `bind-port`.
+const SERVER_PORTS: &str = "server_port=16384-16385";
+
+/// A 200 reply carrying the request's CSeq.
+///
+/// rtsp-types defaults 200's reason phrase to "Ok"; every reply spells it "OK"
+/// because WFD sinks match the phrase as a string.
+fn ok_reply(cseq: u32) -> ResponseBuilder {
+    Response::builder(Version::V1_0, StatusCode::Ok)
+        .reason_phrase("OK")
+        .header(headers::CSEQ, cseq.to_string())
+}
+
+/// The M2 reply — what glint can be asked to do.
+pub fn build_options_reply(cseq: u32) -> Vec<u8> {
+    serialize(Message::from(
+        ok_reply(cseq)
+            .header(headers::PUBLIC, PUBLIC_METHODS)
+            .build(Vec::new()),
+    ))
+}
+
+/// The M6 reply: the sink's own Transport plus the ports glint binds.
+///
+/// No `;timeout=` on the session — GND strips it because it "seems to confuse
+/// some clients", and the reference sink truncates the value at `;` anyway.
+pub fn build_setup_reply(cseq: u32, session: &str, client_transport: &str) -> Vec<u8> {
+    serialize(Message::from(
+        ok_reply(cseq)
+            .header(headers::SESSION, session)
+            .header(
+                headers::TRANSPORT,
+                format!("{client_transport};{SERVER_PORTS}"),
+            )
+            .build(Vec::new()),
+    ))
+}
+
+/// The M7 and M8 reply: 200 plus the session.
+pub fn build_session_reply(cseq: u32, session: &str) -> Vec<u8> {
+    serialize(Message::from(
+        ok_reply(cseq)
+            .header(headers::SESSION, session)
+            .build(Vec::new()),
+    ))
+}
+
+/// The M13 reply, and any other request glint acknowledges without acting.
+///
+/// M13 is deliberately not honoured further: the pipeline already carries a
+/// two-second keyframe interval, which bounds how long a sink's picture stays
+/// broken, and a real force-keyframe hook needs a Runner API that does not
+/// exist yet.
+pub fn build_plain_ok(cseq: u32) -> Vec<u8> {
+    serialize(Message::from(ok_reply(cseq).build(Vec::new())))
+}
+
+/// The refusal for a `Require` glint does not implement.
+pub fn build_unsupported_reply(cseq: u32, unsupported: &str) -> Vec<u8> {
+    serialize(Message::from(
+        Response::builder(Version::V1_0, StatusCode::OptionNotSupported)
+            // The crate's default phrase capitalises every word; RFC 2326
+            // spells it this way, and the sink compares strings.
+            .reason_phrase("Option not supported")
+            .header(headers::CSEQ, cseq.to_string())
+            .header(headers::UNSUPPORTED, unsupported)
             .build(Vec::new()),
     ))
 }
@@ -745,5 +823,124 @@ Session: abcdefghij\r\n\
         // "seems to confuse some clients".
         // act & assert
         assert!(!utf8(build_m16(5, "abcdefghij")).contains("timeout="));
+    }
+
+    #[test]
+    fn the_m2_reply_advertises_the_wfd_profile_first() {
+        // GND prepends exactly "org.wfa.wfd1.0, " to the Public it answers
+        // with, and the sink reads that list to decide what it may send.
+        // act
+        let built = build_options_reply(1);
+        // assert
+        assert_eq!(
+            utf8(built),
+            "RTSP/1.0 200 OK\r\n\
+CSeq: 1\r\n\
+Public: org.wfa.wfd1.0, OPTIONS, GET_PARAMETER, SET_PARAMETER, SETUP, PLAY, PAUSE, TEARDOWN\r\n\
+\r\n"
+        );
+    }
+
+    #[test]
+    fn every_reply_spells_the_reason_phrase_in_capitals() {
+        // rtsp-types' own default for 200 is "Ok", and WFD sinks are
+        // string-matchy about it.
+        for built in [
+            build_options_reply(1),
+            build_setup_reply(2, "abcdefghij", "RTP/AVP/UDP;unicast;client_port=19000"),
+            build_session_reply(3, "abcdefghij"),
+            build_plain_ok(4),
+        ] {
+            // assert
+            let text = utf8(built);
+            assert!(text.starts_with("RTSP/1.0 200 OK\r\n"), "got: {text}");
+        }
+    }
+
+    #[test]
+    fn the_m6_reply_echoes_the_transport_and_adds_our_server_ports() {
+        // server_port has to match the udpsink bind-port the pipeline pins, or
+        // the reply advertises a port nothing is bound to.
+        // act
+        let built = build_setup_reply(2, "abcdefghij", "RTP/AVP/UDP;unicast;client_port=19000");
+        // assert
+        assert_eq!(
+            utf8(built),
+            "RTSP/1.0 200 OK\r\n\
+CSeq: 2\r\n\
+Session: abcdefghij\r\n\
+Transport: RTP/AVP/UDP;unicast;client_port=19000;server_port=16384-16385\r\n\
+\r\n"
+        );
+    }
+
+    #[test]
+    fn no_reply_carries_a_session_timeout_suffix() {
+        // GND suppresses it in responses as well as requests.
+        for built in [
+            build_setup_reply(2, "abcdefghij", "RTP/AVP/UDP;unicast;client_port=19000"),
+            build_session_reply(3, "abcdefghij"),
+        ] {
+            // assert
+            assert!(!utf8(built).contains("timeout="));
+        }
+    }
+
+    #[test]
+    fn the_m7_reply_carries_only_the_session() {
+        // act
+        let built = build_session_reply(3, "abcdefghij");
+        // assert
+        assert_eq!(
+            utf8(built),
+            "RTSP/1.0 200 OK\r\n\
+CSeq: 3\r\n\
+Session: abcdefghij\r\n\
+\r\n"
+        );
+    }
+
+    #[test]
+    fn a_plain_acknowledgement_carries_no_session_at_all() {
+        // M13 arrives before glint has any reason to name a session, and the
+        // reference sink reads nothing but the status from it.
+        // act
+        let built = build_plain_ok(4);
+        // assert
+        assert_eq!(utf8(built), "RTSP/1.0 200 OK\r\nCSeq: 4\r\n\r\n");
+    }
+
+    #[test]
+    fn a_require_glint_does_not_speak_is_answered_with_551() {
+        // The crate's own default phrase here is "Option Not Supported"; RFC
+        // 2326 spells it "Option not supported", and a string-matchy sink gets
+        // the RFC's spelling.
+        // act
+        let built = build_unsupported_reply(1, "org.wfa.wfd9.9");
+        // assert
+        assert_eq!(
+            utf8(built),
+            "RTSP/1.0 551 Option not supported\r\n\
+CSeq: 1\r\n\
+Unsupported: org.wfa.wfd9.9\r\n\
+\r\n"
+        );
+    }
+
+    #[test]
+    fn no_reply_ever_carries_a_content_length() {
+        // Every reply glint sends has an empty body, and the reference sink's
+        // own body-less replies omit the header too — so a Content-Length: 0
+        // here would be glint inventing a form neither side sends.
+        for built in [
+            build_options_reply(1),
+            build_setup_reply(2, "s", "RTP/AVP/UDP;unicast;client_port=19000"),
+            build_session_reply(3, "s"),
+            build_plain_ok(4),
+            build_unsupported_reply(5, "x"),
+        ] {
+            // assert
+            assert!(!utf8(built).contains("Content-Length"));
+        }
     }
 }
