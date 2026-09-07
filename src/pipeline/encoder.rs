@@ -1,5 +1,8 @@
 //! Which H.264 encoder this machine can actually use.
 
+use gstreamer as gst;
+use gstreamer::ElementFactory;
+
 use crate::pipeline::Encoder;
 
 /// Decision D8, in preference order: hardware first, then the two software
@@ -33,9 +36,42 @@ pub fn detect(
         .ok_or(EncoderError::NoEncoder)
 }
 
+/// The registry is process-global, and `gst::init` is idempotent after the
+/// first call, so every entry point that might be reached first may call it.
+pub fn detect_installed(preferred: Option<Encoder>) -> Result<Encoder, EncoderError> {
+    gst::init().ok();
+    detect(preferred, |element| ElementFactory::find(element).is_some())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Touches the real GStreamer registry — never a portal, a screen, or an
+    /// audio device, so it stays safe headless.
+    #[test]
+    fn the_registry_wrapper_answers_from_the_real_registry() {
+        // Asserting a particular encoder would pin this test to one machine's
+        // installed plugins. The machine-independent property is the one that
+        // matters: whatever comes back must actually be installed, and only an
+        // empty registry may produce NoEncoder.
+        // arrange
+        gst::init().ok();
+        let installed = |encoder: &Encoder| ElementFactory::find(encoder.element()).is_some();
+        let any_installed = CHAIN.iter().any(installed);
+        // act
+        let picked = detect_installed(None);
+        // assert
+        match picked {
+            Ok(encoder) => assert!(installed(&encoder), "got: {encoder:?}"),
+            Err(EncoderError::NoEncoder) => {
+                assert!(
+                    !any_installed,
+                    "the registry has an encoder but none was found"
+                )
+            }
+        }
+    }
 
     fn only(installed: &'static [&'static str]) -> impl Fn(&str) -> bool {
         move |element| installed.contains(&element)
