@@ -1558,7 +1558,7 @@ Content-Length: {}\r\n\r\n{body}",
     /// PLAY at 5 s. PLAY is inbound, so it is the liveness base.
     fn at_play() -> Flow {
         let mut flow = flow();
-        flow.on_tick(Duration::from_millis(500));
+        flow.on_tick(PRE_M1_DELAY);
         flow.on_message(&response(1, ""), Duration::from_secs(1));
         flow.on_message(&response(2, SINK_M3_REPLY), Duration::from_secs(2));
         flow.on_message(&response(3, ""), Duration::from_secs(3));
@@ -1569,12 +1569,14 @@ Content-Length: {}\r\n\r\n{body}",
 
     #[test]
     fn nothing_is_sent_before_the_settle_delay_elapses() {
-        // GND waits 500 ms after accept because some sinks race their own
-        // connect and miss anything sent immediately.
+        // GND waits after accept because some sinks race their own connect and
+        // miss anything sent immediately. Asserted against PRE_M1_DELAY rather
+        // than against its value: the number is a field-copied guess, so
+        // pinning it would turn a free choice into a contract.
         // arrange
         let mut flow = flow();
         // act
-        let (out, events) = flow.on_tick(Duration::from_millis(499));
+        let (out, events) = flow.on_tick(PRE_M1_DELAY - Duration::from_millis(1));
         // assert
         assert!(out.is_empty());
         assert!(events.is_empty());
@@ -1585,7 +1587,7 @@ Content-Length: {}\r\n\r\n{body}",
         // arrange
         let mut flow = flow();
         // act
-        let (out, _) = flow.on_tick(Duration::from_millis(500));
+        let (out, _) = flow.on_tick(PRE_M1_DELAY);
         // assert
         assert!(
             wire(&out).starts_with("OPTIONS * RTSP/1.0\r\n"),
@@ -1600,9 +1602,9 @@ Content-Length: {}\r\n\r\n{body}",
         // handshake the sink is already answering.
         // arrange
         let mut flow = flow();
-        flow.on_tick(Duration::from_millis(500));
+        flow.on_tick(PRE_M1_DELAY);
         // act
-        let (out, _) = flow.on_tick(Duration::from_millis(600));
+        let (out, _) = flow.on_tick(PRE_M1_DELAY + Duration::from_millis(100));
         // assert
         assert!(wire(&out).is_empty());
     }
@@ -1611,7 +1613,7 @@ Content-Length: {}\r\n\r\n{body}",
     fn the_m1_reply_is_answered_with_m3() {
         // arrange
         let mut flow = flow();
-        flow.on_tick(Duration::from_millis(500));
+        flow.on_tick(PRE_M1_DELAY);
         // act
         let (out, _) = flow.on_message(&response(1, ""), Duration::from_secs(1));
         // assert
@@ -1624,7 +1626,7 @@ Content-Length: {}\r\n\r\n{body}",
         // Constrained High at the sink's own level 10.
         // arrange
         let mut flow = flow();
-        flow.on_tick(Duration::from_millis(500));
+        flow.on_tick(PRE_M1_DELAY);
         flow.on_message(&response(1, ""), Duration::from_secs(1));
         // act
         let (out, _) = flow.on_message(&response(2, SINK_M3_REPLY), Duration::from_secs(2));
@@ -1652,7 +1654,7 @@ Content-Length: {}\r\n\r\n{body}",
         // destroy the very bytes the fixture is meant to record.
         // arrange
         let mut flow = flow();
-        flow.on_tick(Duration::from_millis(500));
+        flow.on_tick(PRE_M1_DELAY);
         flow.on_message(&response(1, ""), Duration::from_secs(1));
         // act
         let (_, events) = flow.on_message(&response(2, SINK_M3_REPLY), Duration::from_secs(2));
@@ -1674,7 +1676,7 @@ Content-Length: {}\r\n\r\n{body}",
         // acceptance signal.
         // arrange
         let mut flow = flow();
-        flow.on_tick(Duration::from_millis(500));
+        flow.on_tick(PRE_M1_DELAY);
         flow.on_message(&response(1, ""), Duration::from_secs(1));
         flow.on_message(&response(2, SINK_M3_REPLY), Duration::from_secs(2));
         // act
@@ -1687,7 +1689,7 @@ Content-Length: {}\r\n\r\n{body}",
     fn the_setup_reply_carries_a_minted_session_and_our_server_ports() {
         // arrange
         let mut flow = flow();
-        flow.on_tick(Duration::from_millis(500));
+        flow.on_tick(PRE_M1_DELAY);
         flow.on_message(&response(1, ""), Duration::from_secs(1));
         flow.on_message(&response(2, SINK_M3_REPLY), Duration::from_secs(2));
         flow.on_message(&response(3, ""), Duration::from_secs(3));
@@ -1711,7 +1713,7 @@ Transport: RTP/AVP/UDP;unicast;client_port=19000;server_port=16384-16385\r\n\r\n
         // — the sink's actual listening port, not its M3 claim.
         // arrange
         let mut flow = flow();
-        flow.on_tick(Duration::from_millis(500));
+        flow.on_tick(PRE_M1_DELAY);
         flow.on_message(&response(1, ""), Duration::from_secs(1));
         flow.on_message(&response(2, SINK_M3_REPLY), Duration::from_secs(2));
         flow.on_message(&response(3, ""), Duration::from_secs(3));
@@ -1746,11 +1748,11 @@ Transport: RTP/AVP/UDP;unicast;client_port=19000;server_port=16384-16385\r\n\r\n
         // answer cannot depend on which state the flow is in.
         // arrange
         let mut flow = flow();
-        flow.on_tick(Duration::from_millis(500));
+        flow.on_tick(PRE_M1_DELAY);
         // act
         let (out, _) = flow.on_message(
             &request("OPTIONS * RTSP/1.0\r\nCSeq: 50\r\nRequire: org.wfa.wfd1.0\r\n\r\n"),
-            Duration::from_millis(600),
+            PRE_M1_DELAY + Duration::from_millis(100),
         );
         // assert
         assert!(wire(&out).contains("Public: org.wfa.wfd1.0, OPTIONS,"));
@@ -1790,7 +1792,7 @@ Transport: RTP/AVP/UDP;unicast;client_port=19000;server_port=16384-16385\r\n\r\n
     fn an_lpcm_only_sink_gets_a_video_only_m4() {
         // arrange
         let mut flow = flow();
-        flow.on_tick(Duration::from_millis(500));
+        flow.on_tick(PRE_M1_DELAY);
         flow.on_message(&response(1, ""), Duration::from_secs(1));
         let lpcm = SINK_M3_REPLY.replace("AAC 00000007 00", "LPCM 00000002 00");
         // act
@@ -1808,7 +1810,7 @@ Transport: RTP/AVP/UDP;unicast;client_port=19000;server_port=16384-16385\r\n\r\n
     fn a_sink_demanding_hdcp_fails_the_flow_by_name() {
         // arrange
         let mut flow = flow();
-        flow.on_tick(Duration::from_millis(500));
+        flow.on_tick(PRE_M1_DELAY);
         flow.on_message(&response(1, ""), Duration::from_secs(1));
         let hdcp = SINK_M3_REPLY.replace(
             "wfd_content_protection: none",
@@ -1827,7 +1829,7 @@ Transport: RTP/AVP/UDP;unicast;client_port=19000;server_port=16384-16385\r\n\r\n
         // arrange: the sink's only mode is VESA 1920x1200p30, which glint
         // never claims — its masks are CEA-only.
         let mut flow = flow();
-        flow.on_tick(Duration::from_millis(500));
+        flow.on_tick(PRE_M1_DELAY);
         flow.on_message(&response(1, ""), Duration::from_secs(1));
         let disjoint = SINK_M3_REPLY.replace(
             "00 00 03 10 0001ffff 1fffffff 00001fff",
@@ -1846,7 +1848,7 @@ Transport: RTP/AVP/UDP;unicast;client_port=19000;server_port=16384-16385\r\n\r\n
         // treated as demanding HDCP.
         // arrange
         let mut flow = flow();
-        flow.on_tick(Duration::from_millis(500));
+        flow.on_tick(PRE_M1_DELAY);
         flow.on_message(&response(1, ""), Duration::from_secs(1));
         let without = SINK_M3_REPLY.replace("wfd_content_protection: none\r\n", "");
         // act
@@ -1860,7 +1862,7 @@ Transport: RTP/AVP/UDP;unicast;client_port=19000;server_port=16384-16385\r\n\r\n
     fn an_unparsable_m3_reply_fails_the_flow() {
         // arrange
         let mut flow = flow();
-        flow.on_tick(Duration::from_millis(500));
+        flow.on_tick(PRE_M1_DELAY);
         flow.on_message(&response(1, ""), Duration::from_secs(1));
         // act
         let (out, events) = flow.on_message(
@@ -1876,7 +1878,7 @@ Transport: RTP/AVP/UDP;unicast;client_port=19000;server_port=16384-16385\r\n\r\n
     fn an_m3_reply_missing_the_video_formats_fails_the_flow() {
         // arrange
         let mut flow = flow();
-        flow.on_tick(Duration::from_millis(500));
+        flow.on_tick(PRE_M1_DELAY);
         flow.on_message(&response(1, ""), Duration::from_secs(1));
         // act
         let (out, events) = flow.on_message(
@@ -1894,7 +1896,7 @@ Transport: RTP/AVP/UDP;unicast;client_port=19000;server_port=16384-16385\r\n\r\n
         // reply; a source must tolerate parameters it does not know.
         // arrange
         let mut flow = flow();
-        flow.on_tick(Duration::from_millis(500));
+        flow.on_tick(PRE_M1_DELAY);
         flow.on_message(&response(1, ""), Duration::from_secs(1));
         let vendored = format!("microsoft_cursor: none\r\n{SINK_M3_REPLY}intel_thing: 7\r\n");
         // act
@@ -1985,8 +1987,8 @@ Content-Type: text/parameters\r\nContent-Length: {}\r\n\r\n{body}",
         // connects and then says nothing.
         // arrange: M1 is out at 500 ms and awaiting its reply
         let mut flow = flow();
-        flow.on_tick(Duration::from_millis(500));
-        let deadline = Duration::from_millis(500) + REPLY_DEADLINE;
+        flow.on_tick(PRE_M1_DELAY);
+        let deadline = PRE_M1_DELAY + REPLY_DEADLINE;
         // act
         let (_, before) = flow.on_tick(deadline - Duration::from_millis(1));
         let (out, after) = flow.on_tick(deadline);
@@ -2055,7 +2057,7 @@ Content-Type: text/parameters\r\nContent-Length: {}\r\n\r\n{body}",
         // — GND's own gap is that neither bound exists there at all.
         // arrange: M1 out at 500 ms, then long past BOTH deadlines
         let mut flow = flow();
-        flow.on_tick(Duration::from_millis(500));
+        flow.on_tick(PRE_M1_DELAY);
         // act
         let (out, events) = flow.on_tick(SESSION_TIMEOUT + Duration::from_secs(1));
         // assert
@@ -2089,7 +2091,7 @@ Content-Type: text/parameters\r\nContent-Length: {}\r\n\r\n{body}",
         // allows a range and a real television may well send one.
         // arrange
         let mut flow = flow();
-        flow.on_tick(Duration::from_millis(500));
+        flow.on_tick(PRE_M1_DELAY);
         flow.on_message(&response(1, ""), Duration::from_secs(1));
         flow.on_message(&response(2, SINK_M3_REPLY), Duration::from_secs(2));
         flow.on_message(&response(3, ""), Duration::from_secs(3));
@@ -2111,7 +2113,7 @@ Content-Type: text/parameters\r\nContent-Length: {}\r\n\r\n{body}",
         // one would stream into the void.
         // arrange
         let mut flow = flow();
-        flow.on_tick(Duration::from_millis(500));
+        flow.on_tick(PRE_M1_DELAY);
         flow.on_message(&response(1, ""), Duration::from_secs(1));
         flow.on_message(&response(2, SINK_M3_REPLY), Duration::from_secs(2));
         flow.on_message(&response(3, ""), Duration::from_secs(3));
@@ -2160,7 +2162,7 @@ Content-Type: text/parameters\r\nContent-Length: {}\r\n\r\n{body}",
         // destination — so the format has to reach it when it is settled.
         // arrange
         let mut flow = flow();
-        flow.on_tick(Duration::from_millis(500));
+        flow.on_tick(PRE_M1_DELAY);
         flow.on_message(&response(1, ""), Duration::from_secs(1));
         // act
         let (_, events) = flow.on_message(&response(2, SINK_M3_REPLY), Duration::from_secs(2));
@@ -2177,7 +2179,7 @@ Content-Type: text/parameters\r\nContent-Length: {}\r\n\r\n{body}",
     fn the_announcement_says_so_when_there_is_no_audio() {
         // arrange
         let mut flow = flow();
-        flow.on_tick(Duration::from_millis(500));
+        flow.on_tick(PRE_M1_DELAY);
         flow.on_message(&response(1, ""), Duration::from_secs(1));
         let lpcm = SINK_M3_REPLY.replace("AAC 00000007 00", "LPCM 00000002 00");
         // act
@@ -2195,7 +2197,7 @@ Content-Type: text/parameters\r\nContent-Length: {}\r\n\r\n{body}",
     fn a_failed_negotiation_announces_no_format() {
         // arrange
         let mut flow = flow();
-        flow.on_tick(Duration::from_millis(500));
+        flow.on_tick(PRE_M1_DELAY);
         flow.on_message(&response(1, ""), Duration::from_secs(1));
         let hdcp = SINK_M3_REPLY.replace(
             "wfd_content_protection: none",
