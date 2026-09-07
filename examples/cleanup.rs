@@ -25,6 +25,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("removed:           {removed}");
     println!("still stale:       {}", link.stale_groups().await?.len());
     println!();
+    println!("--- `still stale` above is the line that proves anything: `removed` is ---");
+    println!("--- counted before the removals, so it always matches the list ---");
     println!("--- `nmcli connection show` must now list no `glint p2p ...` entry ---");
     println!("--- the paths above are NM connection objects; nmcli shows their names ---");
     Ok(())
