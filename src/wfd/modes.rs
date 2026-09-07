@@ -114,6 +114,39 @@ pub const HH_MODES: [VideoMode; 12] = [
     p(848, 480, 60),   // 11
 ];
 
+/// Which of `wfd_video_formats`' three support bitmaps a bit belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Table {
+    Cea,
+    Vesa,
+    Hh,
+}
+
+/// The single bit that names this mode, and the bitmap it belongs in.
+///
+/// The inverse of `modes_for_mask`, and the arithmetic behind the M4 body:
+/// the reference sink reads the LOWEST set bit of the three masks, so a
+/// source must set exactly one bit across all three or the sink decodes a
+/// mode that was never encoded. Interlaced rows are never matched — a
+/// desktop capture source is progressive — which is also why 1920x1080 at 60
+/// resolves to CEA bit 8 rather than the interlaced bit 9 beside it.
+pub fn bit_for_mode(width: u32, height: u32, fps: u32) -> Option<(Table, u32)> {
+    let tables = [
+        (Table::Cea, CEA_MODES.as_slice()),
+        (Table::Vesa, VESA_MODES.as_slice()),
+        (Table::Hh, HH_MODES.as_slice()),
+    ];
+    for (name, table) in tables {
+        let found = table.iter().position(|mode| {
+            !mode.interlaced && mode.width == width && mode.height == height && mode.fps == fps
+        });
+        if let Some(bit) = found {
+            return Some((name, 1u32 << bit));
+        }
+    }
+    None
+}
+
 /// The modes a support bitmap selects from a table. Bits with no row are
 /// ignored: a newer sink may set bits this table does not know.
 pub fn modes_for_mask(mask: u32, table: &'static [VideoMode]) -> impl Iterator<Item = VideoMode> {
@@ -217,6 +250,85 @@ mod tests {
                 assert!(mode.width > 0 && mode.height > 0, "{mode:?}");
                 assert!(mode.fps > 0, "{mode:?}");
             }
+        }
+    }
+
+    #[test]
+    fn bit_for_mode_finds_the_cea_row_and_returns_one_bit() {
+        // 1920x1080p30 is CEA bit 7 — the mask source-impl hardcodes as
+        // 00000080, which is the cross-check on this arithmetic.
+        // act
+        let found = bit_for_mode(1920, 1080, 30);
+        // assert
+        assert_eq!(found, Some((Table::Cea, 0x0000_0080)));
+    }
+
+    #[test]
+    fn bit_for_mode_finds_a_vesa_row() {
+        // act & assert
+        assert_eq!(bit_for_mode(1920, 1200, 30), Some((Table::Vesa, 1 << 28)));
+    }
+
+    #[test]
+    fn bit_for_mode_finds_a_handheld_row() {
+        // act & assert
+        assert_eq!(bit_for_mode(960, 540, 60), Some((Table::Hh, 1 << 9)));
+    }
+
+    #[test]
+    fn bit_for_mode_returns_exactly_one_set_bit() {
+        // The reference sink picks the LOWEST set bit of the three masks, so a
+        // mask with more than one bit misleads it into a mode we never
+        // encoded. This is the property mutation M4 attacks.
+        for mode in CEA_MODES
+            .iter()
+            .chain(VESA_MODES.iter())
+            .chain(HH_MODES.iter())
+            .filter(|m| !m.interlaced)
+        {
+            // act
+            let (_, mask) = bit_for_mode(mode.width, mode.height, mode.fps)
+                .unwrap_or_else(|| panic!("{mode:?} has no bit"));
+            // assert
+            assert_eq!(mask.count_ones(), 1, "{mode:?} produced mask {mask:#010x}");
+        }
+    }
+
+    #[test]
+    fn bit_for_mode_refuses_a_mode_no_table_lists() {
+        // act & assert
+        assert_eq!(bit_for_mode(3840, 2160, 60), None);
+        assert_eq!(bit_for_mode(1920, 1080, 144), None);
+    }
+
+    #[test]
+    fn bit_for_mode_never_resolves_an_interlaced_row() {
+        // 1920x1080 at 60 exists twice in CEA: progressive at bit 8 and
+        // interlaced at bit 9. A progressive-only source must land on bit 8,
+        // or the M4 body would claim a mode the encoder cannot produce.
+        // act & assert
+        assert_eq!(bit_for_mode(1920, 1080, 60), Some((Table::Cea, 1 << 8)));
+        // 720x480i60 is CEA bit 2 and has no progressive twin at 60 in that
+        // row, so it must resolve to bit 1's 720x480p60 rather than bit 2.
+        assert_eq!(bit_for_mode(720, 480, 60), Some((Table::Cea, 1 << 1)));
+    }
+
+    #[test]
+    fn no_progressive_mode_appears_in_two_tables() {
+        // bit_for_mode searches CEA, then VESA, then HH, so a mode listed in
+        // two tables would make its answer depend on that order. Today no row
+        // collides; this fails the moment a table edit creates one.
+        let mut seen: Vec<(u32, u32, u32)> = Vec::new();
+        for mode in CEA_MODES
+            .iter()
+            .chain(VESA_MODES.iter())
+            .chain(HH_MODES.iter())
+            .filter(|m| !m.interlaced)
+        {
+            let key = (mode.width, mode.height, mode.fps);
+            // assert
+            assert!(!seen.contains(&key), "{key:?} is in two tables");
+            seen.push(key);
         }
     }
 }
