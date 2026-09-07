@@ -12,8 +12,151 @@
 //! disagree, the field behaviour wins and the reason is written down at the
 //! point of the decision.
 
-use crate::wfd::negotiate::H264Profile;
-use crate::wfd::params::{AudioCodec, AudioCodecs, H264Codec, VideoFormats};
+use std::net::SocketAddr;
+
+use rtsp_types::{Message, Method, Request, Url, Version, headers};
+
+use crate::wfd::modes::{Table, bit_for_mode};
+use crate::wfd::negotiate::{ChosenFormat, H264Profile};
+use crate::wfd::params::{
+    AudioCodec, AudioCodecs, ClientRtpPorts, H264Codec, VideoFormats, WfdParam,
+};
+
+/// The request URI of M3, M4, M5 and M16. Literally `localhost`: no sink ever
+/// resolves it, and it is what both reference implementations send.
+const WFD_URI: &str = "rtsp://localhost/wfd1.0";
+
+/// The Wi-Fi Display profile token — M1's `Require`, and the first entry of
+/// the M2 reply's `Public`.
+const WFD_PROFILE: &str = "org.wfa.wfd1.0";
+
+fn wfd_uri() -> Url {
+    // The literal is a constant this crate owns, so a parse failure would be a
+    // bug in that literal rather than anything a peer can provoke.
+    Url::parse(WFD_URI).expect("WFD_URI is a valid URL")
+}
+
+fn serialize<B: AsRef<[u8]>>(message: Message<B>) -> Vec<u8> {
+    let mut out = Vec::new();
+    // Writing into a Vec cannot run out of space, and rtsp-types reports no
+    // other failure for a message it just built.
+    message
+        .write(&mut out)
+        .expect("writing a message into a Vec cannot fail");
+    out
+}
+
+/// A request against `WFD_URI`, with `Content-Type` only when there is a body.
+///
+/// rtsp-types adds `Content-Length` itself for a non-empty body and never adds
+/// `CSeq`, so the caller's counter is the only sequence source.
+fn source_request(cseq: u32, method: Method, body: String) -> Vec<u8> {
+    let mut builder = Request::builder(method, Version::V1_0)
+        .request_uri(wfd_uri())
+        .header(headers::CSEQ, cseq.to_string());
+    if !body.is_empty() {
+        builder = builder.header(headers::CONTENT_TYPE, "text/parameters");
+    }
+    serialize(Message::from(builder.build(body.into_bytes())))
+}
+
+/// M1 — `OPTIONS *`, sent once, `PRE_M1_DELAY` after the sink connects.
+pub fn build_m1(cseq: u32) -> Vec<u8> {
+    serialize(Message::from(
+        Request::builder(Method::Options, Version::V1_0)
+            .header(headers::CSEQ, cseq.to_string())
+            .header(headers::REQUIRE, WFD_PROFILE)
+            .empty(),
+    ))
+}
+
+/// M3 — ask the sink what it can do.
+pub fn build_m3(cseq: u32) -> Vec<u8> {
+    source_request(
+        cseq,
+        Method::GetParameter,
+        format_body(&[
+            ("wfd_video_formats", None),
+            ("wfd_audio_codecs", None),
+            ("wfd_client_rtp_ports", None),
+            ("wfd_content_protection", None),
+        ]),
+    )
+}
+
+/// M4 — declare what glint will actually send.
+///
+/// `local` is the accepted socket's own address: the link layer exposes no IP,
+/// so the socket is the only source of truth for the presentation URL. The
+/// sink's own RTP ports are echoed back unchanged, which is what both
+/// references do.
+pub fn build_m4(
+    cseq: u32,
+    chosen: &ChosenFormat,
+    audio: Option<&AudioCodecs>,
+    local: SocketAddr,
+    sink_ports: &ClientRtpPorts,
+) -> Vec<u8> {
+    let (table, mask) = bit_for_mode(chosen.width, chosen.height, chosen.fps)
+        .expect("negotiate only ever chooses a progressive mode from the tables");
+    let (cea, vesa, hh) = match table {
+        Table::Cea => (mask, 0, 0),
+        Table::Vesa => (0, mask, 0),
+        Table::Hh => (0, 0, mask),
+    };
+    let formats = VideoFormats {
+        native: 0,
+        preferred_display_mode: 0,
+        codecs: vec![H264Codec {
+            profile: chosen.profile.bit(),
+            level: chosen.level,
+            cea,
+            vesa,
+            hh,
+            latency: 0,
+            min_slice_size: 0,
+            slice_enc_params: 0,
+            frame_rate_control: 0,
+            max_hres: None,
+            max_vres: None,
+        }],
+    };
+    let audio = audio
+        .map(WfdParam::format)
+        .unwrap_or_else(|| "none".to_string());
+    let url = format!("rtsp://{local}/wfd1.0/streamid=0 none");
+    source_request(
+        cseq,
+        Method::SetParameter,
+        format_body(&[
+            ("wfd_video_formats", Some(&formats.format())),
+            ("wfd_audio_codecs", Some(&audio)),
+            ("wfd_presentation_URL", Some(&url)),
+            ("wfd_client_rtp_ports", Some(&sink_ports.format())),
+        ]),
+    )
+}
+
+/// M5 — trigger the sink's SETUP.
+pub fn build_m5(cseq: u32) -> Vec<u8> {
+    source_request(
+        cseq,
+        Method::SetParameter,
+        format_body(&[("wfd_trigger_method", Some("SETUP"))]),
+    )
+}
+
+/// M16 — the keep-alive. No `;timeout=` suffix on the session: GND strips it
+/// because it "seems to confuse some clients".
+pub fn build_m16(cseq: u32, session: &str) -> Vec<u8> {
+    serialize(Message::from(
+        Request::builder(Method::GetParameter, Version::V1_0)
+            .request_uri(wfd_uri())
+            .header(headers::CSEQ, cseq.to_string())
+            .header(headers::SESSION, session)
+            .build(Vec::new()),
+    ))
+}
 
 /// The characters a session id may contain. `$` is deliberately absent:
 /// Live555-derived sinks strip it, so an id carrying one comes back changed
@@ -143,7 +286,6 @@ pub fn format_body(params: &[(&str, Option<&str>)]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wfd::params::WfdParam;
 
     #[test]
     fn parse_body_splits_on_the_first_colon_only() {
@@ -419,5 +561,189 @@ mod tests {
         let chosen = select_audio(&sink).expect("AAC bit 0 is on offer");
         // assert
         assert_eq!(chosen.format(), "AAC 00000001 00");
+    }
+
+    /// The negotiated format the M4 tests build on: 1080p30 under Constrained
+    /// High at the reference sink's level 4.2.
+    fn chosen_1080p30() -> ChosenFormat {
+        ChosenFormat {
+            width: 1920,
+            height: 1080,
+            fps: 30,
+            profile: H264Profile::ConstrainedHigh,
+            level: 0x10,
+        }
+    }
+
+    fn sink_ports() -> ClientRtpPorts {
+        ClientRtpPorts::parse("RTP/AVP/UDP;unicast 19000 0 mode=play").unwrap()
+    }
+
+    fn local() -> SocketAddr {
+        "192.168.1.9:7236".parse().unwrap()
+    }
+
+    fn utf8(bytes: Vec<u8>) -> String {
+        String::from_utf8(bytes).expect("glint only ever builds UTF-8 messages")
+    }
+
+    #[test]
+    fn m1_is_options_star_requiring_the_wfd_profile() {
+        // No request URI at all: `OPTIONS *` is the form both references send,
+        // and the reply's Public is logged rather than validated because
+        // source-impl's strict three-token check kills a spec-legal reply.
+        // act
+        let built = build_m1(1);
+        // assert
+        assert_eq!(
+            utf8(built),
+            "OPTIONS * RTSP/1.0\r\n\
+CSeq: 1\r\n\
+Require: org.wfa.wfd1.0\r\n\
+\r\n"
+        );
+    }
+
+    #[test]
+    fn m3_asks_for_exactly_four_parameters_by_bare_name() {
+        // wfd_content_protection is glint's addition to GND's list: negotiate
+        // already consumes it, and an honest HdcpRequired failure beats a
+        // black screen.
+        // act
+        let built = build_m3(2);
+        // assert
+        assert_eq!(
+            utf8(built),
+            "GET_PARAMETER rtsp://localhost/wfd1.0 RTSP/1.0\r\n\
+Content-Length: 83\r\n\
+Content-Type: text/parameters\r\n\
+CSeq: 2\r\n\
+\r\n\
+wfd_video_formats\r\n\
+wfd_audio_codecs\r\n\
+wfd_client_rtp_ports\r\n\
+wfd_content_protection\r\n"
+        );
+    }
+
+    #[test]
+    fn m4_carries_the_whole_negotiated_parameter_set() {
+        // One bit set across the three masks — CEA bit 7 is 00000080 — the
+        // sink's own level echoed back, the presentation URL taken from the
+        // accepted socket, and the sink's own RTP ports echoed.
+        // arrange
+        let audio = select_audio(&AudioCodecs::parse("AAC 00000007 00").unwrap()).unwrap();
+        // act
+        let built = build_m4(3, &chosen_1080p30(), Some(&audio), local(), &sink_ports());
+        // assert
+        assert_eq!(
+            utf8(built),
+            "SET_PARAMETER rtsp://localhost/wfd1.0 RTSP/1.0\r\n\
+Content-Length: 251\r\n\
+Content-Type: text/parameters\r\n\
+CSeq: 3\r\n\
+\r\n\
+wfd_video_formats: 00 00 02 10 00000080 00000000 00000000 00 0000 0000 00 none none\r\n\
+wfd_audio_codecs: AAC 00000001 00\r\n\
+wfd_presentation_URL: rtsp://192.168.1.9:7236/wfd1.0/streamid=0 none\r\n\
+wfd_client_rtp_ports: RTP/AVP/UDP;unicast 19000 0 mode=play\r\n"
+        );
+    }
+
+    #[test]
+    fn m4_declares_no_audio_as_the_literal_none() {
+        // act
+        let built = build_m4(3, &chosen_1080p30(), None, local(), &sink_ports());
+        // assert
+        assert!(utf8(built).contains("wfd_audio_codecs: none\r\n"));
+    }
+
+    #[test]
+    fn m4_sets_exactly_one_bit_across_the_three_video_masks() {
+        // The reference sink reads the LOWEST set bit, so a second bit
+        // anywhere makes it decode a mode glint never encoded.
+        // act
+        let built = utf8(build_m4(3, &chosen_1080p30(), None, local(), &sink_ports()));
+        // arrange: fields 4, 5 and 6 of the value are the cea/vesa/hh masks
+        let line = built
+            .lines()
+            .find(|line| line.starts_with("wfd_video_formats:"))
+            .expect("M4 carries wfd_video_formats");
+        let value = line
+            .split_once(": ")
+            .expect("the parameter line has a value")
+            .1;
+        let fields: Vec<&str> = value.split_whitespace().collect();
+        // act
+        let bits: u32 = fields[4..7]
+            .iter()
+            .map(|field| u32::from_str_radix(field, 16).unwrap().count_ones())
+            .sum();
+        // assert
+        assert_eq!(bits, 1, "got: {line}");
+    }
+
+    #[test]
+    fn m4_puts_a_handheld_mode_in_the_handheld_mask() {
+        // The bit belongs in the table it came from; putting every mode in the
+        // CEA mask would name a completely different resolution.
+        // arrange: 960x540p60 is HH bit 9
+        let chosen = ChosenFormat {
+            width: 960,
+            height: 540,
+            fps: 60,
+            profile: H264Profile::ConstrainedBaseline,
+            level: 0x08,
+        };
+        // act
+        let built = utf8(build_m4(3, &chosen, None, local(), &sink_ports()));
+        // assert
+        assert!(
+            built.contains("wfd_video_formats: 00 00 01 08 00000000 00000000 00000200 "),
+            "got: {built}"
+        );
+    }
+
+    #[test]
+    fn m5_triggers_setup_and_nothing_else() {
+        // The only trigger glint ever sends; the reference sink implements no
+        // other and silently ignores the rest.
+        // act
+        let built = build_m5(4);
+        // assert
+        assert_eq!(
+            utf8(built),
+            "SET_PARAMETER rtsp://localhost/wfd1.0 RTSP/1.0\r\n\
+Content-Length: 27\r\n\
+Content-Type: text/parameters\r\n\
+CSeq: 4\r\n\
+\r\n\
+wfd_trigger_method: SETUP\r\n"
+        );
+    }
+
+    #[test]
+    fn m16_is_a_body_less_get_parameter_carrying_the_session() {
+        // The EMPTY body is what makes this M16 rather than M3 to the
+        // reference classifier, and an empty body is why no Content-Length is
+        // emitted — which the sink's own replies also omit.
+        // act
+        let built = build_m16(5, "abcdefghij");
+        // assert
+        assert_eq!(
+            utf8(built),
+            "GET_PARAMETER rtsp://localhost/wfd1.0 RTSP/1.0\r\n\
+CSeq: 5\r\n\
+Session: abcdefghij\r\n\
+\r\n"
+        );
+    }
+
+    #[test]
+    fn no_source_message_carries_a_session_timeout_suffix() {
+        // GND strips ";timeout=30" from outgoing Session headers because it
+        // "seems to confuse some clients".
+        // act & assert
+        assert!(!utf8(build_m16(5, "abcdefghij")).contains("timeout="));
     }
 }
