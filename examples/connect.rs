@@ -16,6 +16,14 @@ use glint::receiver::MacAddr;
 /// so the run must not report one before the negotiation has had a fair go.
 const ACTIVATION_WINDOW: Duration = Duration::from_secs(45);
 
+/// NetworkManager's device states from `prepare` through `secondaries` are
+/// the ones where an activation is still in progress. Outside that band it
+/// has settled — activated, failed, or torn back down — and waiting out the
+/// rest of the window would only hide which.
+fn still_activating(state: u32) -> bool {
+    (40..=90).contains(&state)
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mac: MacAddr = std::env::args()
@@ -59,7 +67,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut state = link.device_state().await?;
     let mut waited = Duration::ZERO;
     let step = Duration::from_secs(3);
-    while state != DEVICE_STATE_ACTIVATED && waited < ACTIVATION_WINDOW {
+    // Tracked because a state outside the activating band means two
+    // different things before and after NetworkManager has entered it:
+    // beforehand it has simply not started yet, afterwards it has given up.
+    let mut started = still_activating(state);
+    while waited < ACTIVATION_WINDOW {
         tokio::time::sleep(step).await;
         waited += step;
         state = link.device_state().await?;
@@ -67,16 +79,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "  after {:>3}s:      device state {state}",
             waited.as_secs()
         );
+        if state == DEVICE_STATE_ACTIVATED {
+            break;
+        }
+        if still_activating(state) {
+            started = true;
+        } else if started {
+            break;
+        }
     }
 
     if state == DEVICE_STATE_ACTIVATED {
-        println!("link up:           yes, device state {state}");
-    } else {
+        println!("link up:           yes (device state {state})");
+    } else if still_activating(state) {
         println!(
-            "link up:           NO - stalled at device state {state} after {}s",
+            "link up:           NO, STALLED at device state {state} after {}s",
             waited.as_secs()
         );
-        println!("                   (100 is activated; 50 is `config`, still negotiating)");
+        println!("                   NetworkManager is still negotiating and has not given up");
+    } else {
+        println!("link up:           NO, activation FAILED (device state {state})");
+        println!("                   NetworkManager gave up; its reason is in");
+        println!("                   `journalctl -u NetworkManager` as a state-change line");
     }
 
     // No state printed here on purpose: a read taken straight after

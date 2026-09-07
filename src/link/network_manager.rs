@@ -298,6 +298,20 @@ fn already_gone(error_name: &str) -> bool {
     )
 }
 
+/// An activation that is already down is the state `disconnect` wanted, so
+/// NetworkManager saying so is success rather than failure. The mirror of
+/// `already_gone` for activations, and needed for the same reason: a cast
+/// NetworkManager dropped on its own — which is what a lost link looks
+/// like — has to tear down cleanly, or every caller ends up matching on an
+/// error string to tell a real failure from an expected one.
+///
+/// Measured: NetworkManager answers a deactivation for an activation it has
+/// already ended with `ConnectionNotActive`. That is the only name accepted
+/// here; nothing broader was added on speculation.
+fn already_down(error_name: &str) -> bool {
+    error_name == "org.freedesktop.NetworkManager.ConnectionNotActive"
+}
+
 /// `None` covers a missing key and a non-string value alike, because a
 /// profile glint cannot name is certainly not a profile glint created.
 fn connection_id(sections: &HashMap<String, HashMap<String, OwnedValue>>) -> Option<String> {
@@ -534,14 +548,19 @@ impl P2pLink for NetworkManagerLink {
             .get(&handle)
             .cloned()
             .ok_or_else(|| LinkError::Backend("unknown link handle".to_string()))?;
-        ManagerProxy::new(&self.connection)
+        let outcome = ManagerProxy::new(&self.connection)
             .await
             .map_err(backend)?
             .deactivate_connection(&activation.as_ref())
-            .await
-            .map_err(backend)?;
-        // Forgotten only once the deactivation succeeded. Dropping it first
-        // would turn a transient D-Bus failure into a permanently
+            .await;
+        match outcome {
+            Ok(()) => {}
+            Err(zbus::Error::MethodError(name, _, _)) if already_down(name.as_str()) => {}
+            Err(error) => return Err(backend(error)),
+        }
+        // Forgotten only once the link is actually down, whether this call
+        // put it there or found it there. Dropping the handle before the
+        // call would turn a transient D-Bus failure into a permanently
         // unreachable activation: the retry would answer "unknown link
         // handle" instead of the real error, and nothing would hold the
         // path any more.
@@ -767,6 +786,36 @@ mod tests {
         for name in failures {
             assert!(
                 !already_gone(name),
+                "{name} must be reported, not swallowed"
+            );
+        }
+    }
+
+    #[test]
+    fn an_activation_that_is_already_down_counts_as_disconnected() {
+        // arrange, act, assert
+        assert!(already_down(
+            "org.freedesktop.NetworkManager.ConnectionNotActive"
+        ));
+    }
+
+    #[test]
+    fn a_real_deactivation_failure_is_not_swallowed() {
+        // arrange
+        let failures = [
+            "org.freedesktop.DBus.Error.AccessDenied",
+            "org.freedesktop.DBus.Error.NoReply",
+            "org.freedesktop.NetworkManager.Failed",
+            // Near-misses on purpose: the match is exact, not a prefix or
+            // substring test, so a neighbouring NM error must not pass.
+            "org.freedesktop.NetworkManager.ConnectionNotActiveYet",
+            "ConnectionNotActive",
+            "",
+        ];
+        // act, assert
+        for name in failures {
+            assert!(
+                !already_down(name),
                 "{name} must be reported, not swallowed"
             );
         }
