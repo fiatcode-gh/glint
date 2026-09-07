@@ -3,9 +3,10 @@
 
 use crate::link::{LinkError, P2pLink};
 
-/// Removes every P2P group a previous glint left behind and reports how
-/// many went. Generic over the trait so the daemon's startup path is
-/// testable without a radio.
+/// Removes every P2P group a previous glint left behind, reporting how many
+/// removals reported success — which includes any that were already gone,
+/// since the link layer treats a vanished group as removed. Generic over
+/// the trait so the daemon's startup path is testable without a radio.
 pub async fn clean_stale_groups<L: P2pLink>(link: &L) -> Result<usize, LinkError> {
     let stale = link.stale_groups().await?;
     let count = stale.len();
