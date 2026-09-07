@@ -588,6 +588,16 @@ impl Flow {
         }
     }
 
+    /// Give up on the flow for a reason the driver found rather than the
+    /// protocol: bytes that are not RTSP at all, or a socket that failed. The
+    /// state machine stays the only thing that decides the flow is over.
+    pub fn abort(&mut self, reason: String) -> (Vec<Outbound>, Vec<FlowEvent>) {
+        if self.state == FlowState::Done {
+            return (Vec::new(), Vec::new());
+        }
+        self.fail(reason)
+    }
+
     /// The socket closed. The reference sink never sends M8, so this is the
     /// normal end of a cast rather than an error.
     pub fn on_hangup(&mut self) -> Vec<FlowEvent> {
@@ -2092,5 +2102,33 @@ Content-Type: text/parameters\r\nContent-Length: {}\r\n\r\n{body}",
         // assert
         assert!(failed(&events).is_some());
         assert!(closed(&out));
+    }
+
+    #[test]
+    fn an_abort_closes_the_flow_and_names_the_reason() {
+        // The driver calls this when the bytes are not RTSP at all, which the
+        // protocol has no message for.
+        // arrange
+        let mut flow = at_play();
+        // act
+        let (out, events) = flow.abort("the peer sent bytes that are not RTSP".to_string());
+        // assert
+        assert!(closed(&out));
+        assert_eq!(
+            failed(&events).as_deref(),
+            Some("the peer sent bytes that are not RTSP")
+        );
+    }
+
+    #[test]
+    fn an_abort_after_the_flow_is_over_says_nothing() {
+        // arrange
+        let mut flow = at_play();
+        flow.on_hangup();
+        // act
+        let (out, events) = flow.abort("too late".to_string());
+        // assert
+        assert!(out.is_empty());
+        assert!(events.is_empty());
     }
 }
