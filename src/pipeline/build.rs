@@ -105,20 +105,24 @@ video/x-raw,width={width},height={height},framerate={fps}/1 ! \
     );
 
     if spec.audio {
-        // Two constraints in one fragment. LPCM 48 kHz 16-bit stereo is the
-        // Wi-Fi Display mandatory audio codec, so every sink accepts it and
-        // the branch needs no encoder element; S16BE is the byte order
-        // MPEG-TS carries LPCM in.
-        //
-        // `stream.capture.sink=true` is what makes the branch record what is
+        // `stream.capture.sink=true` is what makes this branch record what is
         // playing: WirePlumber reads it and links the stream to the default
-        // sink's monitor ports, and relinks when the default changes. Naming
-        // a sink with `target-object` INSTEAD records the default microphone
-        // — measured — so that property must never appear without this one.
+        // sink's monitor ports, relinking when the default changes. Naming a
+        // sink with `target-object` INSTEAD records the default microphone —
+        // measured — so that property must never appear without this one.
+        //
+        // AAC rather than the LPCM the Wi-Fi Display specification makes
+        // mandatory, because LPCM is unreachable here (decision D15).
+        // mpegtsmux accepts `audio/x-lpcm`, and no element in GStreamer
+        // produces it from live audio — the only sources of that media type
+        // are demuxers, for remuxing an existing transport stream. AAC-LC is
+        // the specification's optional codec that every sink implements in
+        // practice. `aacparse` is required, not decoration: mpegtsmux demands
+        // `framed=true` on audio/mpeg.
         pipeline.push_str(
             " pipewiresrc stream-properties=\"props,stream.capture.sink=true\" \
 do-timestamp=true ! audioconvert ! audioresample ! \
-audio/x-raw,format=S16BE,rate=48000,channels=2 ! mux.",
+audio/x-raw,rate=48000,channels=2 ! avenc_aac ! aacparse ! mux.",
         );
     }
 
@@ -157,8 +161,8 @@ video/x-raw,width=1920,height=1080,framerate=60/1 ! ";
     const VIDEO_TAIL: &str = " ! h264parse config-interval=-1 ! mpegtsmux name=mux ! rtpmp2tpay";
     const AUDIO_BRANCH: &str = " pipewiresrc \
 stream-properties=\"props,stream.capture.sink=true\" do-timestamp=true ! \
-audioconvert ! audioresample ! \
-audio/x-raw,format=S16BE,rate=48000,channels=2 ! mux.";
+audioconvert ! audioresample ! audio/x-raw,rate=48000,channels=2 ! \
+avenc_aac ! aacparse ! mux.";
 
     // ---- the six snapshots ----
 

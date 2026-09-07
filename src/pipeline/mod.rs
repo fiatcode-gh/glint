@@ -63,6 +63,69 @@ pub struct PipelineSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline::build::build;
+    use crate::pipeline::encoder::detect_installed;
+    use gstreamer as gst;
+
+    /// The portal heads cannot run inside a test, so they are swapped for test
+    /// sources. Everything downstream of them — the caps clauses, the encoder
+    /// arm, the parser, the muxer and the tail — is the builder's own text,
+    /// and that is where linking succeeds or fails.
+    fn without_the_portal(description: &str) -> String {
+        description
+            .replace(
+                "pipewiresrc stream-properties=\"props,stream.capture.sink=true\" \
+do-timestamp=true",
+                "audiotestsrc num-buffers=1",
+            )
+            .replace(
+                "pipewiresrc fd=40 path=42 do-timestamp=true",
+                "videotestsrc num-buffers=1",
+            )
+    }
+
+    fn constructible_spec(audio: bool, output: Output) -> PipelineSpec {
+        PipelineSpec {
+            // Whatever this host actually has. Pinning an encoder would make
+            // the test fail on a machine that simply installed a different one.
+            encoder: detect_installed(None).expect("no H.264 encoder on this host"),
+            width: 1280,
+            height: 720,
+            fps: 30,
+            bitrate_kbps: 8_000,
+            audio,
+            video_node: 42,
+            video_fd: 40,
+            output,
+        }
+    }
+
+    /// A snapshot pins the TEXT. It cannot tell whether the text describes a
+    /// graph GStreamer can build, so a caps clause the muxer refuses passes
+    /// every snapshot and fails at the first real run — which is exactly how a
+    /// raw-PCM audio branch once reached a user with six green snapshots
+    /// behind it.
+    #[test]
+    fn the_built_description_is_a_graph_gstreamer_can_actually_link() {
+        // arrange
+        gst::init().ok();
+        // act & assert
+        for output in [
+            Output::Rtp,
+            Output::File("/tmp/glint-link-check.ts".to_string()),
+        ] {
+            for audio in [false, true] {
+                let description =
+                    without_the_portal(&build(&constructible_spec(audio, output.clone())));
+                let parsed = gst::parse::launch(&description);
+                assert!(
+                    parsed.is_ok(),
+                    "audio={audio} failed to link: {:?}\nfrom: {description}",
+                    parsed.err()
+                );
+            }
+        }
+    }
 
     #[test]
     fn every_encoder_names_its_gstreamer_element() {
