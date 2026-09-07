@@ -13,16 +13,40 @@
 //! point of the decision.
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use rtsp_types::{
     Message, Method, Request, Response, ResponseBuilder, StatusCode, Url, Version, headers,
 };
 
 use crate::wfd::modes::{Table, bit_for_mode};
-use crate::wfd::negotiate::{ChosenFormat, H264Profile};
+use crate::wfd::negotiate::{ChosenFormat, H264Profile, negotiate};
 use crate::wfd::params::{
-    AudioCodec, AudioCodecs, ClientRtpPorts, H264Codec, VideoFormats, WfdParam,
+    AudioCodec, AudioCodecs, ClientRtpPorts, ContentProtection, H264Codec, VideoFormats, WfdParam,
 };
+
+/// GND waits 500 ms after the sink connects before sending M1: some sinks race
+/// their own connect and miss anything sent immediately. The exact value is
+/// copied from the field, not measured from a sink.
+pub const PRE_M1_DELAY: Duration = Duration::from_millis(500);
+
+/// How long glint waits for any one awaited message before giving up.
+///
+/// Neither reference has such a deadline: GND hangs forever on a sink that
+/// connects and goes silent, because no session exists yet so its 30 s session
+/// timer cannot fire either. This is glint's addition. Ten seconds is a
+/// politeness bound for a television that hesitates, not a measured property,
+/// and bounding every single await is what bounds the whole handshake.
+pub const REPLY_DEADLINE: Duration = Duration::from_secs(10);
+
+/// WFD 6.5.1's session timeout minus five seconds.
+pub const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(25);
+
+/// The session dies after this long with NO inbound traffic of any kind.
+/// Liveness is deliberately not tracked per message: GND records that "some
+/// sinks do not reply with the correct session-id", so matching replies to the
+/// requests that provoked them is a trap.
+pub const SESSION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The request URI of M3, M4, M5 and M16. Literally `localhost`: no sink ever
 /// resolves it, and it is what both reference implementations send.
@@ -359,6 +383,500 @@ pub fn format_body(params: &[(&str, Option<&str>)]) -> String {
             None => format!("{name}\r\n"),
         })
         .collect()
+}
+
+/// Where the flow is in the M1-M8 sequence. One variant per protocol position:
+/// what glint is waiting for is the whole of its state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlowState {
+    /// Connected, waiting out `PRE_M1_DELAY` before M1 goes out.
+    Settling,
+    AwaitingM1Reply,
+    AwaitingM3Reply,
+    AwaitingM4Reply,
+    /// M5 sent. The sink's SETUP is the real acceptance signal for M4, because
+    /// both references answer M4 with 200 before parsing a byte of it.
+    AwaitingSetup,
+    AwaitingPlay,
+    Streaming,
+    /// Torn down or failed. Terminal.
+    Done,
+}
+
+/// What the driver must put on the socket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outbound {
+    /// Already-serialized bytes, so a test asserts exactly what a sink sees.
+    Bytes(Vec<u8>),
+    Close,
+}
+
+/// What the flow's caller has to act on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FlowEvent {
+    /// The M3 reply body, verbatim. Normalising it would destroy the bytes the
+    /// real-television fixture is meant to record.
+    M3Captured(Vec<u8>),
+    /// The sink is playing: start the pipeline pointed here.
+    Play {
+        rtp_host: String,
+        rtp_port: u16,
+    },
+    Teardown,
+    Failed(String),
+}
+
+/// The Wi-Fi Display flow over one accepted connection.
+///
+/// Pure: it reads no clock and touches no socket. `on_tick` and `on_message`
+/// both take the elapsed time since the connection was accepted, which is what
+/// makes every deadline arithmetic a test can pin exactly.
+#[derive(Debug)]
+pub struct Flow {
+    state: FlowState,
+    /// The accepted socket's own address, for the presentation URL. The link
+    /// layer exposes no IP, so the socket is the only source of truth.
+    local: SocketAddr,
+    /// The sink's address. Its IP is where RTP goes.
+    peer: SocketAddr,
+    session_seed: u64,
+    cseq: u32,
+    session: Option<String>,
+    chosen: Option<ChosenFormat>,
+    audio: Option<AudioCodecs>,
+    sink_ports: Option<ClientRtpPorts>,
+    rtp_port: Option<u16>,
+    /// When the message glint is currently awaiting was sent.
+    awaiting_since: Option<Duration>,
+    /// When the last inbound message of any kind arrived. `None` until the
+    /// session is armed at SETUP, which is when liveness starts mattering.
+    last_inbound: Option<Duration>,
+    last_keep_alive: Option<Duration>,
+}
+
+impl Flow {
+    pub fn new(local: SocketAddr, peer: SocketAddr, session_seed: u64) -> Self {
+        Flow {
+            state: FlowState::Settling,
+            local,
+            peer,
+            session_seed,
+            cseq: 0,
+            session: None,
+            chosen: None,
+            audio: None,
+            sink_ports: None,
+            rtp_port: None,
+            awaiting_since: None,
+            last_inbound: None,
+            last_keep_alive: None,
+        }
+    }
+
+    pub fn state(&self) -> FlowState {
+        self.state
+    }
+
+    pub fn session(&self) -> Option<&str> {
+        self.session.as_deref()
+    }
+
+    /// The negotiated video format, once M3 has been answered. The pipeline
+    /// needs it and `FlowEvent::Play` deliberately carries only the
+    /// destination, so it is read from here.
+    pub fn chosen_format(&self) -> Option<ChosenFormat> {
+        self.chosen
+    }
+
+    pub fn audio_selected(&self) -> bool {
+        self.audio.is_some()
+    }
+
+    fn next_cseq(&mut self) -> u32 {
+        self.cseq += 1;
+        self.cseq
+    }
+
+    /// Send a message and start waiting for whatever answers it.
+    fn send_awaiting(&mut self, bytes: Vec<u8>, next: FlowState, now: Duration) -> Vec<Outbound> {
+        self.state = next;
+        self.awaiting_since = Some(now);
+        vec![Outbound::Bytes(bytes)]
+    }
+
+    fn fail(&mut self, reason: String) -> (Vec<Outbound>, Vec<FlowEvent>) {
+        self.state = FlowState::Done;
+        (vec![Outbound::Close], vec![FlowEvent::Failed(reason)])
+    }
+
+    /// Advance the timers. `now` is the time since the connection was accepted.
+    pub fn on_tick(&mut self, now: Duration) -> (Vec<Outbound>, Vec<FlowEvent>) {
+        if self.state == FlowState::Done {
+            return (Vec::new(), Vec::new());
+        }
+
+        if self.state == FlowState::Settling {
+            if now < PRE_M1_DELAY {
+                return (Vec::new(), Vec::new());
+            }
+            let cseq = self.next_cseq();
+            let out = self.send_awaiting(build_m1(cseq), FlowState::AwaitingM1Reply, now);
+            return (out, Vec::new());
+        }
+
+        // Liveness first: once it has expired, a keep-alive would be shouting
+        // into a session that is already gone.
+        if let Some(last) = self.last_inbound
+            && now.saturating_sub(last) >= SESSION_TIMEOUT
+        {
+            return self.fail(format!(
+                "the sink sent nothing for {} seconds",
+                SESSION_TIMEOUT.as_secs()
+            ));
+        }
+
+        if let Some(sent) = self.awaiting_since
+            && now.saturating_sub(sent) >= REPLY_DEADLINE
+        {
+            return self.fail(format!(
+                "the sink did not answer within {} seconds",
+                REPLY_DEADLINE.as_secs()
+            ));
+        }
+
+        if let (Some(session), Some(last)) = (self.session.clone(), self.last_keep_alive)
+            && now.saturating_sub(last) >= KEEP_ALIVE_INTERVAL
+        {
+            self.last_keep_alive = Some(now);
+            let cseq = self.next_cseq();
+            // A keep-alive is not awaited: GND treats a missing reply as
+            // harmless and lets the liveness deadline be the only judge.
+            return (vec![Outbound::Bytes(build_m16(cseq, &session))], Vec::new());
+        }
+
+        (Vec::new(), Vec::new())
+    }
+
+    /// Take one message from the sink.
+    pub fn on_message(
+        &mut self,
+        message: &Message<Vec<u8>>,
+        now: Duration,
+    ) -> (Vec<Outbound>, Vec<FlowEvent>) {
+        if self.state == FlowState::Done {
+            return (Vec::new(), Vec::new());
+        }
+
+        // Any inbound message counts as liveness, once the session exists.
+        if self.session.is_some() {
+            self.last_inbound = Some(now);
+        }
+
+        match message {
+            Message::Data(frame) => {
+                // WFD never interleaves data on the control channel, so this is
+                // a misbehaving sink. Logged rather than dropped silently.
+                tracing::warn!(
+                    channel = frame.channel_id(),
+                    bytes = frame.len(),
+                    "the sink interleaved a data frame on the RTSP channel"
+                );
+                (Vec::new(), Vec::new())
+            }
+            Message::Request(request) => self.on_request(request, now),
+            Message::Response(response) => self.on_response(response, now),
+        }
+    }
+
+    /// The socket closed. The reference sink never sends M8, so this is the
+    /// normal end of a cast rather than an error.
+    pub fn on_hangup(&mut self) -> Vec<FlowEvent> {
+        if self.state == FlowState::Done {
+            return Vec::new();
+        }
+        self.state = FlowState::Done;
+        vec![FlowEvent::Teardown]
+    }
+
+    fn on_request(
+        &mut self,
+        request: &Request<Vec<u8>>,
+        now: Duration,
+    ) -> (Vec<Outbound>, Vec<FlowEvent>) {
+        let cseq = match request
+            .header(&headers::CSEQ)
+            .and_then(|value| value.as_str().trim().parse::<u32>().ok())
+        {
+            Some(cseq) => cseq,
+            None => {
+                return self.fail("the sink sent a request with no usable CSeq".to_string());
+            }
+        };
+
+        match request.method() {
+            // M2, and any later OPTIONS. Answered from any state: the
+            // reference sink sends it the moment it has replied to M1.
+            Method::Options => {
+                if let Some(require) = request.header(&headers::REQUIRE)
+                    && !require.as_str().trim().eq_ignore_ascii_case(WFD_PROFILE)
+                {
+                    let unsupported = require.as_str().trim().to_string();
+                    let refusal = build_unsupported_reply(cseq, &unsupported);
+                    self.state = FlowState::Done;
+                    return (
+                        vec![Outbound::Bytes(refusal), Outbound::Close],
+                        vec![FlowEvent::Failed(format!(
+                            "the sink requires {unsupported}, which glint does not implement"
+                        ))],
+                    );
+                }
+                (vec![Outbound::Bytes(build_options_reply(cseq))], Vec::new())
+            }
+            Method::Setup => self.on_setup(request, cseq, now),
+            Method::Play => self.on_play(cseq),
+            Method::Teardown => {
+                self.state = FlowState::Done;
+                let reply = match &self.session {
+                    Some(session) => build_session_reply(cseq, session),
+                    None => build_plain_ok(cseq),
+                };
+                (
+                    vec![Outbound::Bytes(reply), Outbound::Close],
+                    vec![FlowEvent::Teardown],
+                )
+            }
+            // M13 and the other sink-initiated SET_PARAMETERs, plus any
+            // GET_PARAMETER the sink sends. Acknowledged and not acted on:
+            // M13's recovery is already bounded by the pipeline's two-second
+            // keyframe interval, and the rest carry nothing glint consumes.
+            Method::SetParameter | Method::GetParameter => {
+                let body = parse_body(request.body());
+                if body_has(&body, "wfd_idr_request") {
+                    tracing::debug!(%cseq, "the sink asked for a keyframe");
+                } else if let Some((name, _)) = body.first() {
+                    tracing::debug!(%cseq, %name, "the sink sent a parameter glint does not act on");
+                }
+                (vec![Outbound::Bytes(build_plain_ok(cseq))], Vec::new())
+            }
+            other => self.fail(format!("the sink sent an unexpected {other:?} request")),
+        }
+    }
+
+    fn on_setup(
+        &mut self,
+        request: &Request<Vec<u8>>,
+        cseq: u32,
+        now: Duration,
+    ) -> (Vec<Outbound>, Vec<FlowEvent>) {
+        let Some(transport) = request
+            .header(&headers::TRANSPORT)
+            .map(|value| value.as_str().trim().to_string())
+        else {
+            return self.fail("the sink's SETUP carried no Transport header".to_string());
+        };
+        let Some(rtp_port) = client_port(&transport) else {
+            return self.fail(format!(
+                "the sink's SETUP Transport names no client port: {transport}"
+            ));
+        };
+
+        // GND effectively uses the SETUP port and ignores the M3 claim, so a
+        // mismatch is worth saying out loud but never worth refusing over.
+        if let Some(claimed) = &self.sink_ports
+            && claimed.rtp_port0 != rtp_port
+        {
+            tracing::warn!(
+                m3_port = claimed.rtp_port0,
+                setup_port = rtp_port,
+                "the sink's SETUP port disagrees with its wfd_client_rtp_ports; using SETUP"
+            );
+        }
+
+        let session = session_id(self.session_seed);
+        let reply = build_setup_reply(cseq, &session, &transport);
+        self.session = Some(session);
+        self.rtp_port = Some(rtp_port);
+        self.state = FlowState::AwaitingPlay;
+        // The session exists from here, so both timers start now.
+        self.last_inbound = Some(now);
+        self.last_keep_alive = Some(now);
+        self.awaiting_since = Some(now);
+        (vec![Outbound::Bytes(reply)], Vec::new())
+    }
+
+    fn on_play(&mut self, cseq: u32) -> (Vec<Outbound>, Vec<FlowEvent>) {
+        let (Some(session), Some(rtp_port)) = (self.session.clone(), self.rtp_port) else {
+            return self.fail("the sink sent PLAY before SETUP".to_string());
+        };
+        self.state = FlowState::Streaming;
+        self.awaiting_since = None;
+        (
+            vec![Outbound::Bytes(build_session_reply(cseq, &session))],
+            vec![FlowEvent::Play {
+                rtp_host: self.peer.ip().to_string(),
+                rtp_port,
+            }],
+        )
+    }
+
+    fn on_response(
+        &mut self,
+        response: &Response<Vec<u8>>,
+        now: Duration,
+    ) -> (Vec<Outbound>, Vec<FlowEvent>) {
+        match self.state {
+            // GND never validates the M1 reply, and source-impl's strict
+            // three-token check on its Public kills a spec-legal answer.
+            FlowState::AwaitingM1Reply => {
+                tracing::debug!(
+                    status = ?response.status(),
+                    public = ?response.header(&headers::PUBLIC).map(|v| v.as_str()),
+                    "the sink answered M1"
+                );
+                let cseq = self.next_cseq();
+                let out = self.send_awaiting(build_m3(cseq), FlowState::AwaitingM3Reply, now);
+                (out, Vec::new())
+            }
+            FlowState::AwaitingM3Reply => self.on_capabilities(response, now),
+            // A 200 here means nothing — both references reply before parsing
+            // — so the trigger goes out and SETUP is the real signal.
+            FlowState::AwaitingM4Reply => {
+                tracing::debug!(status = ?response.status(), "the sink answered M4");
+                let cseq = self.next_cseq();
+                let out = self.send_awaiting(build_m5(cseq), FlowState::AwaitingSetup, now);
+                (out, Vec::new())
+            }
+            // A keep-alive reply, or the sink answering M5. Its arrival is all
+            // that matters: it has already reset the liveness deadline.
+            _ => {
+                tracing::debug!(status = ?response.status(), "the sink sent a reply glint only counts as liveness");
+                (Vec::new(), Vec::new())
+            }
+        }
+    }
+
+    fn on_capabilities(
+        &mut self,
+        response: &Response<Vec<u8>>,
+        now: Duration,
+    ) -> (Vec<Outbound>, Vec<FlowEvent>) {
+        let raw = response.body().to_vec();
+        let body = parse_body(&raw);
+        let captured = FlowEvent::M3Captured(raw);
+
+        let Some(formats) = body_value(&body, "wfd_video_formats") else {
+            return with(
+                captured,
+                self.fail("the sink's M3 reply carried no wfd_video_formats".to_string()),
+            );
+        };
+        let sink_formats = match VideoFormats::parse(formats) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                return with(
+                    captured,
+                    self.fail(format!(
+                        "the sink's wfd_video_formats is unreadable: {error}"
+                    )),
+                );
+            }
+        };
+
+        // A sink that omits content protection is not demanding it. GND never
+        // even asks for the parameter.
+        let protection = match body_value(&body, "wfd_content_protection") {
+            Some(value) => match ContentProtection::parse(value) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    return with(
+                        captured,
+                        self.fail(format!(
+                            "the sink's wfd_content_protection is unreadable: {error}"
+                        )),
+                    );
+                }
+            },
+            None => ContentProtection::None,
+        };
+
+        let chosen = match negotiate(&our_video_formats(), &sink_formats, &protection) {
+            Ok(chosen) => chosen,
+            Err(error) => return with(captured, self.fail(error.to_string())),
+        };
+
+        let sink_audio = match body_value(&body, "wfd_audio_codecs") {
+            Some(value) => match AudioCodecs::parse(value) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    return with(
+                        captured,
+                        self.fail(format!(
+                            "the sink's wfd_audio_codecs is unreadable: {error}"
+                        )),
+                    );
+                }
+            },
+            None => AudioCodecs(Vec::new()),
+        };
+        let audio = select_audio(&sink_audio);
+        if audio.is_none() {
+            tracing::warn!(
+                offered = %sink_audio.format(),
+                "no AAC at 48 kHz stereo on offer; casting video only"
+            );
+        }
+
+        // The ports are echoed verbatim in M4 whatever they say — it is
+        // protocol theatre on both sides — so an unreadable value is only
+        // worth a warning, and SETUP is where the real port comes from.
+        let sink_ports = body_value(&body, "wfd_client_rtp_ports")
+            .and_then(|value| match ClientRtpPorts::parse(value) {
+                Ok(parsed) => Some(parsed),
+                Err(error) => {
+                    tracing::warn!(%error, "the sink's wfd_client_rtp_ports is unreadable");
+                    None
+                }
+            })
+            .unwrap_or_else(|| ClientRtpPorts {
+                profile: "RTP/AVP/UDP;unicast".to_string(),
+                rtp_port0: 0,
+                rtp_port1: 0,
+                mode: "play".to_string(),
+            });
+
+        self.chosen = Some(chosen);
+        self.audio = audio;
+        self.sink_ports = Some(sink_ports.clone());
+
+        let cseq = self.next_cseq();
+        let m4 = build_m4(cseq, &chosen, self.audio.as_ref(), self.local, &sink_ports);
+        let out = self.send_awaiting(m4, FlowState::AwaitingM4Reply, now);
+        (out, vec![captured])
+    }
+}
+
+/// Put the M3 capture in front of whatever else a step produced, so the raw
+/// bytes reach the caller even when the negotiation over them fails — that
+/// failure is exactly when a human most wants to see them.
+fn with(
+    captured: FlowEvent,
+    (out, events): (Vec<Outbound>, Vec<FlowEvent>),
+) -> (Vec<Outbound>, Vec<FlowEvent>) {
+    let mut all = vec![captured];
+    all.extend(events);
+    (out, all)
+}
+
+/// The first port of a Transport header's `client_port`.
+///
+/// The reference sink sends a single port, but the grammar allows `n-m` and a
+/// real television may send one; the first is the RTP port either way.
+fn client_port(transport: &str) -> Option<u16> {
+    transport
+        .split(';')
+        .find_map(|field| field.trim().strip_prefix("client_port="))
+        .and_then(|value| value.split('-').next())
+        .and_then(|digits| digits.trim().parse().ok())
 }
 
 #[cfg(test)]
@@ -942,5 +1460,637 @@ Unsupported: org.wfa.wfd9.9\r\n\
             // assert
             assert!(!utf8(built).contains("Content-Length"));
         }
+    }
+
+    /// The reference sink's default M3 reply body, from its documented values.
+    const SINK_M3_REPLY: &str = "wfd_video_formats: 00 00 03 10 0001ffff 1fffffff 00001fff 00 0000 0000 00 none none\r\n\
+wfd_audio_codecs: AAC 00000007 00\r\n\
+wfd_client_rtp_ports: RTP/AVP/UDP;unicast 19000 0 mode=play\r\n\
+wfd_content_protection: none\r\n";
+
+    const SINK_SETUP: &str = "SETUP rtsp://192.168.1.9:7236/wfd1.0/streamid=0 RTSP/1.0\r\n\
+CSeq: 100\r\nTransport: RTP/AVP/UDP;unicast;client_port=19000\r\n\r\n";
+
+    const SINK_PLAY: &str = "PLAY rtsp://192.168.1.9:7236/wfd1.0/streamid=0 RTSP/1.0\r\n\
+CSeq: 101\r\nSession: abc\r\n\r\n";
+
+    fn flow() -> Flow {
+        Flow::new(local(), "192.168.1.20:41234".parse().unwrap(), 7)
+    }
+
+    /// The bytes a step put on the wire, concatenated.
+    fn wire(out: &[Outbound]) -> String {
+        out.iter()
+            .filter_map(|item| match item {
+                Outbound::Bytes(bytes) => Some(String::from_utf8_lossy(bytes).to_string()),
+                Outbound::Close => None,
+            })
+            .collect()
+    }
+
+    fn closed(out: &[Outbound]) -> bool {
+        out.iter().any(|item| matches!(item, Outbound::Close))
+    }
+
+    fn failed(events: &[FlowEvent]) -> Option<String> {
+        events.iter().find_map(|event| match event {
+            FlowEvent::Failed(reason) => Some(reason.clone()),
+            _ => None,
+        })
+    }
+
+    /// A 200 reply from the sink, with a correct Content-Length so the whole
+    /// message parses rather than leaving its body in the buffer.
+    fn response(cseq: u32, body: &str) -> Message<Vec<u8>> {
+        let raw = if body.is_empty() {
+            format!("RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\n\r\n")
+        } else {
+            format!(
+                "RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\nContent-Type: text/parameters\r\n\
+Content-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        Message::parse(raw.as_bytes())
+            .expect("the test fixture is a valid message")
+            .0
+    }
+
+    fn request(raw: &str) -> Message<Vec<u8>> {
+        Message::parse(raw.as_bytes())
+            .expect("the test fixture is a valid message")
+            .0
+    }
+
+    /// A flow walked to PLAY: M1 at 0.5 s, replies at 1-3 s, SETUP at 4 s and
+    /// PLAY at 5 s. PLAY is inbound, so it is the liveness base.
+    fn at_play() -> Flow {
+        let mut flow = flow();
+        flow.on_tick(Duration::from_millis(500));
+        flow.on_message(&response(1, ""), Duration::from_secs(1));
+        flow.on_message(&response(2, SINK_M3_REPLY), Duration::from_secs(2));
+        flow.on_message(&response(3, ""), Duration::from_secs(3));
+        flow.on_message(&request(SINK_SETUP), Duration::from_secs(4));
+        flow.on_message(&request(SINK_PLAY), Duration::from_secs(5));
+        flow
+    }
+
+    #[test]
+    fn nothing_is_sent_before_the_settle_delay_elapses() {
+        // GND waits 500 ms after accept because some sinks race their own
+        // connect and miss anything sent immediately.
+        // arrange
+        let mut flow = flow();
+        // act
+        let (out, events) = flow.on_tick(Duration::from_millis(499));
+        // assert
+        assert!(out.is_empty());
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn m1_goes_out_once_the_settle_delay_is_up() {
+        // arrange
+        let mut flow = flow();
+        // act
+        let (out, _) = flow.on_tick(Duration::from_millis(500));
+        // assert
+        assert!(
+            wire(&out).starts_with("OPTIONS * RTSP/1.0\r\n"),
+            "{:?}",
+            wire(&out)
+        );
+    }
+
+    #[test]
+    fn m1_is_never_sent_twice() {
+        // GND sends it exactly once; a second OPTIONS would restart the
+        // handshake the sink is already answering.
+        // arrange
+        let mut flow = flow();
+        flow.on_tick(Duration::from_millis(500));
+        // act
+        let (out, _) = flow.on_tick(Duration::from_millis(600));
+        // assert
+        assert!(wire(&out).is_empty());
+    }
+
+    #[test]
+    fn the_m1_reply_is_answered_with_m3() {
+        // arrange
+        let mut flow = flow();
+        flow.on_tick(Duration::from_millis(500));
+        // act
+        let (out, _) = flow.on_message(&response(1, ""), Duration::from_secs(1));
+        // assert
+        assert!(wire(&out).starts_with("GET_PARAMETER rtsp://localhost/wfd1.0 RTSP/1.0\r\n"));
+    }
+
+    #[test]
+    fn the_m3_reply_is_negotiated_into_m4() {
+        // CEA bit 7 is the highest mode both sides claim, so 1080p30 under
+        // Constrained High at the sink's own level 10.
+        // arrange
+        let mut flow = flow();
+        flow.on_tick(Duration::from_millis(500));
+        flow.on_message(&response(1, ""), Duration::from_secs(1));
+        // act
+        let (out, _) = flow.on_message(&response(2, SINK_M3_REPLY), Duration::from_secs(2));
+        // assert
+        let sent = wire(&out);
+        assert!(
+            sent.contains(
+                "wfd_video_formats: 00 00 02 10 00000080 00000000 00000000 00 0000 0000 00 none none\r\n"
+            ),
+            "got: {sent}"
+        );
+        assert!(
+            sent.contains("wfd_audio_codecs: AAC 00000001 00\r\n"),
+            "got: {sent}"
+        );
+        assert!(
+            sent.contains("wfd_client_rtp_ports: RTP/AVP/UDP;unicast 19000 0 mode=play\r\n"),
+            "got: {sent}"
+        );
+    }
+
+    #[test]
+    fn the_raw_m3_reply_body_is_surfaced_verbatim() {
+        // The capture path for the real-TV fixture: normalising it here would
+        // destroy the very bytes the fixture is meant to record.
+        // arrange
+        let mut flow = flow();
+        flow.on_tick(Duration::from_millis(500));
+        flow.on_message(&response(1, ""), Duration::from_secs(1));
+        // act
+        let (_, events) = flow.on_message(&response(2, SINK_M3_REPLY), Duration::from_secs(2));
+        // assert
+        let captured = events
+            .iter()
+            .find_map(|event| match event {
+                FlowEvent::M3Captured(raw) => Some(raw.clone()),
+                _ => None,
+            })
+            .expect("the M3 reply is captured");
+        assert_eq!(captured, SINK_M3_REPLY.as_bytes());
+    }
+
+    #[test]
+    fn the_m4_reply_is_answered_with_the_setup_trigger() {
+        // A 200 to M4 proves nothing — the reference sink replies before it
+        // parses — so the trigger goes out regardless and M6 is the real
+        // acceptance signal.
+        // arrange
+        let mut flow = flow();
+        flow.on_tick(Duration::from_millis(500));
+        flow.on_message(&response(1, ""), Duration::from_secs(1));
+        flow.on_message(&response(2, SINK_M3_REPLY), Duration::from_secs(2));
+        // act
+        let (out, _) = flow.on_message(&response(3, ""), Duration::from_secs(3));
+        // assert
+        assert!(wire(&out).contains("wfd_trigger_method: SETUP\r\n"));
+    }
+
+    #[test]
+    fn the_setup_reply_carries_a_minted_session_and_our_server_ports() {
+        // arrange
+        let mut flow = flow();
+        flow.on_tick(Duration::from_millis(500));
+        flow.on_message(&response(1, ""), Duration::from_secs(1));
+        flow.on_message(&response(2, SINK_M3_REPLY), Duration::from_secs(2));
+        flow.on_message(&response(3, ""), Duration::from_secs(3));
+        // act
+        let (out, _) = flow.on_message(&request(SINK_SETUP), Duration::from_secs(4));
+        // assert
+        let sent = wire(&out);
+        let session = flow.session().expect("SETUP mints a session").to_string();
+        assert_eq!(
+            sent,
+            format!(
+                "RTSP/1.0 200 OK\r\nCSeq: 100\r\nSession: {session}\r\n\
+Transport: RTP/AVP/UDP;unicast;client_port=19000;server_port=16384-16385\r\n\r\n"
+            )
+        );
+    }
+
+    #[test]
+    fn play_is_answered_and_names_the_rtp_destination() {
+        // The host is the accepted socket's peer, the port is M6's client_port
+        // — the sink's actual listening port, not its M3 claim.
+        // arrange
+        let mut flow = flow();
+        flow.on_tick(Duration::from_millis(500));
+        flow.on_message(&response(1, ""), Duration::from_secs(1));
+        flow.on_message(&response(2, SINK_M3_REPLY), Duration::from_secs(2));
+        flow.on_message(&response(3, ""), Duration::from_secs(3));
+        flow.on_message(&request(SINK_SETUP), Duration::from_secs(4));
+        // act
+        let (out, events) = flow.on_message(&request(SINK_PLAY), Duration::from_secs(5));
+        // assert
+        assert!(wire(&out).starts_with("RTSP/1.0 200 OK\r\nCSeq: 101\r\n"));
+        let destination = events
+            .iter()
+            .find_map(|event| match event {
+                FlowEvent::Play { rtp_host, rtp_port } => Some((rtp_host.clone(), *rtp_port)),
+                _ => None,
+            })
+            .expect("PLAY names the destination");
+        assert_eq!(destination, ("192.168.1.20".to_string(), 19000));
+    }
+
+    #[test]
+    fn the_negotiated_format_is_readable_for_the_pipeline() {
+        // act
+        let flow = at_play();
+        // assert
+        let chosen = flow.chosen_format().expect("the format is negotiated");
+        assert_eq!((chosen.width, chosen.height, chosen.fps), (1920, 1080, 30));
+        assert!(flow.audio_selected());
+    }
+
+    #[test]
+    fn an_inbound_options_is_answered_wherever_it_arrives() {
+        // The reference sink sends M2 the moment it has replied to M1, so the
+        // answer cannot depend on which state the flow is in.
+        // arrange
+        let mut flow = flow();
+        flow.on_tick(Duration::from_millis(500));
+        // act
+        let (out, _) = flow.on_message(
+            &request("OPTIONS * RTSP/1.0\r\nCSeq: 50\r\nRequire: org.wfa.wfd1.0\r\n\r\n"),
+            Duration::from_millis(600),
+        );
+        // assert
+        assert!(wire(&out).contains("Public: org.wfa.wfd1.0, OPTIONS,"));
+    }
+
+    #[test]
+    fn an_inbound_options_without_a_require_header_is_still_answered() {
+        // arrange
+        let mut flow = flow();
+        // act
+        let (out, events) = flow.on_message(
+            &request("OPTIONS * RTSP/1.0\r\nCSeq: 50\r\n\r\n"),
+            Duration::ZERO,
+        );
+        // assert
+        assert!(wire(&out).contains("Public: org.wfa.wfd1.0, OPTIONS,"));
+        assert!(failed(&events).is_none());
+    }
+
+    #[test]
+    fn a_require_we_do_not_speak_is_refused_and_fails_the_flow() {
+        // arrange
+        let mut flow = flow();
+        // act
+        let (out, events) = flow.on_message(
+            &request("OPTIONS * RTSP/1.0\r\nCSeq: 50\r\nRequire: org.wfa.wfd9.9\r\n\r\n"),
+            Duration::ZERO,
+        );
+        // assert
+        assert!(wire(&out).starts_with("RTSP/1.0 551 Option not supported\r\n"));
+        assert!(wire(&out).contains("Unsupported: org.wfa.wfd9.9\r\n"));
+        assert!(failed(&events).is_some());
+        assert!(closed(&out));
+    }
+
+    #[test]
+    fn an_lpcm_only_sink_gets_a_video_only_m4() {
+        // arrange
+        let mut flow = flow();
+        flow.on_tick(Duration::from_millis(500));
+        flow.on_message(&response(1, ""), Duration::from_secs(1));
+        let lpcm = SINK_M3_REPLY.replace("AAC 00000007 00", "LPCM 00000002 00");
+        // act
+        let (out, events) = flow.on_message(&response(2, &lpcm), Duration::from_secs(2));
+        // assert
+        assert!(wire(&out).contains("wfd_audio_codecs: none\r\n"));
+        assert!(
+            failed(&events).is_none(),
+            "a video-only cast is not a failure"
+        );
+        assert!(!flow.audio_selected());
+    }
+
+    #[test]
+    fn a_sink_demanding_hdcp_fails_the_flow_by_name() {
+        // arrange
+        let mut flow = flow();
+        flow.on_tick(Duration::from_millis(500));
+        flow.on_message(&response(1, ""), Duration::from_secs(1));
+        let hdcp = SINK_M3_REPLY.replace(
+            "wfd_content_protection: none",
+            "wfd_content_protection: HDCP2.0 port=1189",
+        );
+        // act
+        let (out, events) = flow.on_message(&response(2, &hdcp), Duration::from_secs(2));
+        // assert
+        let reason = failed(&events).expect("HDCP fails the flow");
+        assert!(reason.contains("HDCP"), "got: {reason}");
+        assert!(closed(&out));
+    }
+
+    #[test]
+    fn a_sink_sharing_no_video_format_fails_the_flow() {
+        // arrange: the sink's only mode is VESA 1920x1200p30, which glint
+        // never claims — its masks are CEA-only.
+        let mut flow = flow();
+        flow.on_tick(Duration::from_millis(500));
+        flow.on_message(&response(1, ""), Duration::from_secs(1));
+        let disjoint = SINK_M3_REPLY.replace(
+            "00 00 03 10 0001ffff 1fffffff 00001fff",
+            "00 00 03 10 00000000 10000000 00000000",
+        );
+        // act
+        let (out, events) = flow.on_message(&response(2, &disjoint), Duration::from_secs(2));
+        // assert
+        assert!(failed(&events).is_some());
+        assert!(closed(&out));
+    }
+
+    #[test]
+    fn a_missing_content_protection_parameter_is_read_as_none() {
+        // GND never even asks for it, so a sink that omits it must not be
+        // treated as demanding HDCP.
+        // arrange
+        let mut flow = flow();
+        flow.on_tick(Duration::from_millis(500));
+        flow.on_message(&response(1, ""), Duration::from_secs(1));
+        let without = SINK_M3_REPLY.replace("wfd_content_protection: none\r\n", "");
+        // act
+        let (out, events) = flow.on_message(&response(2, &without), Duration::from_secs(2));
+        // assert
+        assert!(failed(&events).is_none());
+        assert!(wire(&out).contains("wfd_video_formats: 00 00 02 10 00000080 "));
+    }
+
+    #[test]
+    fn an_unparsable_m3_reply_fails_the_flow() {
+        // arrange
+        let mut flow = flow();
+        flow.on_tick(Duration::from_millis(500));
+        flow.on_message(&response(1, ""), Duration::from_secs(1));
+        // act
+        let (out, events) = flow.on_message(
+            &response(2, "wfd_video_formats: not hex at all\r\n"),
+            Duration::from_secs(2),
+        );
+        // assert
+        assert!(failed(&events).is_some());
+        assert!(closed(&out));
+    }
+
+    #[test]
+    fn an_m3_reply_missing_the_video_formats_fails_the_flow() {
+        // arrange
+        let mut flow = flow();
+        flow.on_tick(Duration::from_millis(500));
+        flow.on_message(&response(1, ""), Duration::from_secs(1));
+        // act
+        let (out, events) = flow.on_message(
+            &response(2, "wfd_audio_codecs: AAC 00000007 00\r\n"),
+            Duration::from_secs(2),
+        );
+        // assert
+        assert!(failed(&events).is_some());
+        assert!(closed(&out));
+    }
+
+    #[test]
+    fn vendor_parameters_in_an_m3_reply_are_ignored_not_refused() {
+        // An ini file can add microsoft_* and intel_* lines to a real sink's
+        // reply; a source must tolerate parameters it does not know.
+        // arrange
+        let mut flow = flow();
+        flow.on_tick(Duration::from_millis(500));
+        flow.on_message(&response(1, ""), Duration::from_secs(1));
+        let vendored = format!("microsoft_cursor: none\r\n{SINK_M3_REPLY}intel_thing: 7\r\n");
+        // act
+        let (out, events) = flow.on_message(&response(2, &vendored), Duration::from_secs(2));
+        // assert
+        assert!(failed(&events).is_none());
+        assert!(wire(&out).contains("wfd_video_formats: 00 00 02 10 00000080 "));
+    }
+
+    #[test]
+    fn an_inbound_teardown_is_answered_and_ends_the_flow() {
+        // arrange
+        let mut flow = at_play();
+        // act
+        let (out, events) = flow.on_message(
+            &request("TEARDOWN rtsp://x/wfd1.0 RTSP/1.0\r\nCSeq: 200\r\nSession: abc\r\n\r\n"),
+            Duration::from_secs(6),
+        );
+        // assert
+        assert!(wire(&out).starts_with("RTSP/1.0 200 OK\r\nCSeq: 200\r\n"));
+        assert!(closed(&out));
+        assert!(events.iter().any(|e| matches!(e, FlowEvent::Teardown)));
+    }
+
+    #[test]
+    fn an_idr_request_is_acknowledged_and_otherwise_ignored() {
+        // The pipeline's two-second keyframe interval bounds the sink's
+        // recovery; a real force-keyframe hook is future work.
+        // arrange
+        let mut flow = at_play();
+        let body = "wfd_idr_request\r\n";
+        let raw = format!(
+            "SET_PARAMETER rtsp://x/wfd1.0 RTSP/1.0\r\nCSeq: 201\r\n\
+Content-Type: text/parameters\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        // act
+        let (out, events) = flow.on_message(&request(&raw), Duration::from_secs(6));
+        // assert
+        assert_eq!(wire(&out), "RTSP/1.0 200 OK\r\nCSeq: 201\r\n\r\n");
+        assert!(failed(&events).is_none());
+        assert!(!closed(&out));
+    }
+
+    #[test]
+    fn a_hangup_ends_the_flow_the_way_a_teardown_does() {
+        // The reference sink NEVER sends M8; a TCP hangup is the field norm.
+        // arrange
+        let mut flow = at_play();
+        // act
+        let events = flow.on_hangup();
+        // assert
+        assert!(events.iter().any(|e| matches!(e, FlowEvent::Teardown)));
+    }
+
+    #[test]
+    fn a_hangup_after_teardown_says_nothing_twice() {
+        // arrange
+        let mut flow = at_play();
+        flow.on_message(
+            &request("TEARDOWN rtsp://x/wfd1.0 RTSP/1.0\r\nCSeq: 200\r\n\r\n"),
+            Duration::from_secs(6),
+        );
+        // act
+        let events = flow.on_hangup();
+        // assert
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn a_data_frame_is_surfaced_and_changes_nothing() {
+        // WFD never interleaves data on the control channel, so a frame here
+        // means a misbehaving sink — dropping it silently would hide that.
+        // arrange
+        let mut flow = at_play();
+        let raw = [b'$', 0x00, 0x00, 0x02, 0xaa, 0xbb];
+        let frame = Message::parse(&raw).expect("a data frame parses").0;
+        // act
+        let (out, events) = flow.on_message(&frame, Duration::from_secs(6));
+        // assert
+        assert!(out.is_empty());
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn a_silent_sink_fails_the_flow_at_the_reply_deadline() {
+        // GND has no per-request timeout and hangs forever on a sink that
+        // connects and then says nothing.
+        // arrange: M1 is out at 500 ms and awaiting its reply
+        let mut flow = flow();
+        flow.on_tick(Duration::from_millis(500));
+        let deadline = Duration::from_millis(500) + REPLY_DEADLINE;
+        // act
+        let (_, before) = flow.on_tick(deadline - Duration::from_millis(1));
+        let (out, after) = flow.on_tick(deadline);
+        // assert
+        assert!(failed(&before).is_none());
+        assert!(failed(&after).is_some());
+        assert!(closed(&out));
+    }
+
+    #[test]
+    fn the_keep_alive_goes_out_every_twenty_five_seconds_after_setup() {
+        // WFD 6.5.1's session timeout minus five. The CSeq is 5 because M1,
+        // M3, M4 and M5 took 1 through 4.
+        // arrange: SETUP armed the timers at 4 s
+        let mut flow = at_play();
+        let due = Duration::from_secs(4) + KEEP_ALIVE_INTERVAL;
+        // act
+        let (early, _) = flow.on_tick(due - Duration::from_millis(1));
+        let (m16, _) = flow.on_tick(due);
+        // assert
+        assert!(wire(&early).is_empty());
+        assert_eq!(
+            wire(&m16),
+            format!(
+                "GET_PARAMETER rtsp://localhost/wfd1.0 RTSP/1.0\r\nCSeq: 5\r\nSession: {}\r\n\r\n",
+                flow.session().expect("the session is armed")
+            )
+        );
+    }
+
+    #[test]
+    fn a_session_with_no_inbound_traffic_dies_at_the_session_timeout() {
+        // arrange: PLAY at 5 s is the last inbound message, so it is the base
+        let mut flow = at_play();
+        let deadline = Duration::from_secs(5) + SESSION_TIMEOUT;
+        // act
+        let (_, alive) = flow.on_tick(deadline - Duration::from_millis(1));
+        let (out, dead) = flow.on_tick(deadline);
+        // assert
+        assert!(failed(&alive).is_none());
+        assert!(failed(&dead).is_some());
+        assert!(closed(&out));
+    }
+
+    #[test]
+    fn any_inbound_traffic_postpones_the_liveness_deadline() {
+        // GND tracks liveness per SESSION, not per message, because "some
+        // sinks do not reply with the correct session-id" — so ANY inbound
+        // message resets it. Without the reset, 35 s would already be dead.
+        // arrange: a keep-alive reply lands at 20 s
+        let mut flow = at_play();
+        flow.on_message(&response(5, ""), Duration::from_secs(20));
+        // act
+        let (_, at_35) = flow.on_tick(Duration::from_secs(35));
+        let (_, at_51) = flow.on_tick(Duration::from_secs(51));
+        // assert: 15 s after the traffic it is alive, 31 s after it is dead
+        assert!(failed(&at_35).is_none(), "the deadline was not reset");
+        assert!(failed(&at_51).is_some());
+    }
+
+    #[test]
+    fn before_setup_it_is_the_reply_deadline_that_bounds_the_handshake() {
+        // No session exists until SETUP, so liveness is not armed yet and the
+        // reply deadline is the only bound. Arming liveness earlier would
+        // double-bound the handshake and report the wrong reason for a stall
+        // — GND's own gap is that neither bound exists there at all.
+        // arrange: M1 out at 500 ms, then long past BOTH deadlines
+        let mut flow = flow();
+        flow.on_tick(Duration::from_millis(500));
+        // act
+        let (out, events) = flow.on_tick(SESSION_TIMEOUT + Duration::from_secs(1));
+        // assert
+        let reason = failed(&events).expect("the handshake is bounded before SETUP");
+        assert!(
+            reason.contains("did not answer"),
+            "the reply deadline should be the reason, got: {reason}"
+        );
+        assert!(closed(&out));
+        assert_eq!(flow.session(), None);
+    }
+
+    #[test]
+    fn a_finished_flow_stays_quiet_forever() {
+        // arrange
+        let mut flow = at_play();
+        flow.on_message(
+            &request("TEARDOWN rtsp://x/wfd1.0 RTSP/1.0\r\nCSeq: 200\r\n\r\n"),
+            Duration::from_secs(6),
+        );
+        // act
+        let (out, events) = flow.on_tick(Duration::from_secs(600));
+        // assert
+        assert!(out.is_empty());
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn a_transport_naming_a_port_range_takes_the_first_port() {
+        // The reference sink sends a single port, but the header's grammar
+        // allows a range and a real television may well send one.
+        // arrange
+        let mut flow = flow();
+        flow.on_tick(Duration::from_millis(500));
+        flow.on_message(&response(1, ""), Duration::from_secs(1));
+        flow.on_message(&response(2, SINK_M3_REPLY), Duration::from_secs(2));
+        flow.on_message(&response(3, ""), Duration::from_secs(3));
+        let setup = SINK_SETUP.replace("client_port=19000", "client_port=19000-19001");
+        flow.on_message(&request(&setup), Duration::from_secs(4));
+        // act
+        let (_, events) = flow.on_message(&request(SINK_PLAY), Duration::from_secs(5));
+        // assert
+        let port = events.iter().find_map(|event| match event {
+            FlowEvent::Play { rtp_port, .. } => Some(*rtp_port),
+            _ => None,
+        });
+        assert_eq!(port, Some(19000));
+    }
+
+    #[test]
+    fn a_setup_without_a_usable_transport_fails_the_flow() {
+        // Without a client port there is nowhere to send RTP, and inventing
+        // one would stream into the void.
+        // arrange
+        let mut flow = flow();
+        flow.on_tick(Duration::from_millis(500));
+        flow.on_message(&response(1, ""), Duration::from_secs(1));
+        flow.on_message(&response(2, SINK_M3_REPLY), Duration::from_secs(2));
+        flow.on_message(&response(3, ""), Duration::from_secs(3));
+        let setup = SINK_SETUP.replace(
+            "Transport: RTP/AVP/UDP;unicast;client_port=19000",
+            "Transport: RTP/AVP/UDP;unicast",
+        );
+        // act
+        let (out, events) = flow.on_message(&request(&setup), Duration::from_secs(4));
+        // assert
+        assert!(failed(&events).is_some());
+        assert!(closed(&out));
     }
 }
