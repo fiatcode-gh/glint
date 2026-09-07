@@ -34,10 +34,11 @@ impl Encoder {
 /// Where the muxed stream goes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Output {
-    /// A cast. The string stops at the payloader because the destination
-    /// arrives in `wfd_client_rtp_ports` over RTSP, and the RTSP layer
-    /// appends the sink once it knows where to send.
-    Rtp,
+    /// A cast. Both fields come from the RTSP layer: the host is the accepted
+    /// connection's peer address, and the port is M6 SETUP's `client_port` —
+    /// the port the sink actually listens on, whatever its earlier
+    /// `wfd_client_rtp_ports` claimed.
+    Rtp { host: String, port: u16 },
     /// A local recording — what the manual capture check plays in mpv.
     File(String),
 }
@@ -111,7 +112,10 @@ do-timestamp=true",
         gst::init().ok();
         // act & assert
         for output in [
-            Output::Rtp,
+            Output::Rtp {
+                host: "127.0.0.1".to_string(),
+                port: 19000,
+            },
             Output::File("/tmp/glint-link-check.ts".to_string()),
         ] {
             for audio in [false, true] {

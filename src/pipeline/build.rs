@@ -81,8 +81,13 @@ pub fn build(spec: &PipelineSpec) -> String {
     encoder_args.push(format!("{}={}", p.keyframe, keyframe_frames(spec.fps)));
     encoder_args.extend(p.extra.iter().map(|e| (*e).to_string()));
 
+    // `sync=false async=false` on the sink: a live cast must not block on the
+    // receiver's clock or wait for a preroll it will never get.
     let tail = match &spec.output {
-        Output::Rtp => "rtpmp2tpay".to_string(),
+        Output::Rtp { host, port } => format!(
+            "rtpmp2tpay ! udpsink host={host} port={port} bind-port=16384 \
+sync=false async=false"
+        ),
         Output::File(path) => format!("filesink location={path}"),
     };
 
@@ -94,7 +99,8 @@ pub fn build(spec: &PipelineSpec) -> String {
         "pipewiresrc fd={fd} path={node} do-timestamp=true ! videoconvert ! \
 videorate name=rate ! videoscale ! \
 video/x-raw,width={width},height={height},framerate={fps}/1 ! \
-{element} {args} ! h264parse config-interval=-1 ! mpegtsmux name=mux ! {tail}",
+{element} {args} ! h264parse config-interval=-1 ! \
+mpegtsmux name=mux alignment=7 ! {tail}",
         fd = spec.video_fd,
         node = spec.video_node,
         width = spec.width,
@@ -143,7 +149,10 @@ mod tests {
             audio,
             video_node: 42,
             video_fd: 40,
-            output: Output::Rtp,
+            output: Output::Rtp {
+                host: "192.168.1.5".to_string(),
+                port: 19000,
+            },
         }
     }
 
@@ -157,7 +166,9 @@ mod tests {
     const VIDEO_HEAD: &str = "pipewiresrc fd=40 path=42 do-timestamp=true ! \
 videoconvert ! videorate name=rate ! videoscale ! \
 video/x-raw,width=1920,height=1080,framerate=60/1 ! ";
-    const VIDEO_TAIL: &str = " ! h264parse config-interval=-1 ! mpegtsmux name=mux ! rtpmp2tpay";
+    const VIDEO_TAIL: &str = " ! h264parse config-interval=-1 ! \
+mpegtsmux name=mux alignment=7 ! rtpmp2tpay ! udpsink host=192.168.1.5 \
+port=19000 bind-port=16384 sync=false async=false";
     const AUDIO_BRANCH: &str = " pipewiresrc \
 stream-properties=\"props,stream.capture.sink=true\" do-timestamp=true ! \
 audioconvert ! audioresample ! audio/x-raw,rate=48000,channels=2 ! avenc_aac ! mux.";
@@ -322,14 +333,48 @@ gop-size=120{VIDEO_TAIL}{AUDIO_BRANCH}"
     // ---- the two output tails ----
 
     #[test]
-    fn the_rtp_output_stops_at_the_payloader_with_no_destination() {
-        // The sink's host and port arrive in wfd_client_rtp_ports over RTSP,
-        // in Milestone 2. Emitting a udpsink here would mean inventing them.
+    fn the_rtp_output_sends_to_the_negotiated_host_and_port() {
+        // The destination is no longer invented: the host is the accepted RTSP
+        // connection's peer address and the port is M6 SETUP's client_port.
+        // bind-port=16384 is what makes the M6 reply's server_port=16384-16385
+        // honest rather than a number nothing is bound to.
         // act
         let built = build(&spec(Encoder::VaH264, false));
         // assert
-        assert!(built.ends_with("rtpmp2tpay"), "got: {built}");
-        assert!(!built.contains("udpsink"), "got: {built}");
+        assert!(
+            built.ends_with(
+                "rtpmp2tpay ! udpsink host=192.168.1.5 port=19000 bind-port=16384 \
+sync=false async=false"
+            ),
+            "got: {built}"
+        );
+    }
+
+    #[test]
+    fn the_rtp_output_leaves_the_payload_type_at_the_mp2t_default() {
+        // Wi-Fi Display requires the MP2T static assignment, 33, which is
+        // already rtpmp2tpay's own default — naming it would be a second copy
+        // of the number, free to drift from the default it is restating.
+        // act
+        let built = build(&spec(Encoder::VaH264, false));
+        // assert
+        assert!(!built.contains("pt="), "got: {built}");
+    }
+
+    #[test]
+    fn the_muxer_aligns_seven_transport_packets_per_buffer() {
+        // Seven 188-byte transport packets are 1316 bytes, the payload size
+        // UDP streaming wants; without it the muxer emits whatever it has.
+        // act & assert
+        for built in [
+            build(&spec(Encoder::VaH264, false)),
+            build(&file_spec(false)),
+        ] {
+            assert!(
+                built.contains("mpegtsmux name=mux alignment=7"),
+                "got: {built}"
+            );
+        }
     }
 
     #[test]
