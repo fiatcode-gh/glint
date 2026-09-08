@@ -472,8 +472,11 @@ Content-Type: text/parameters\r\nContent-Length: 19\r\n\r\nwfd_video_formats\r\n
         let FrameError::NotRtsp { escaped } = &error else {
             panic!("expected NotRtsp, got {error:?}");
         };
+        // Asserted against a literal rather than against ESCAPE_LIMIT: a test
+        // that reads the constant it is guarding moves with it, and passes no
+        // matter how far the bound is raised.
         assert!(
-            escaped.len() <= ESCAPE_LIMIT,
+            escaped.len() < 1_000,
             "the dump grew to {} bytes with the peer choosing the length",
             escaped.len()
         );
@@ -609,25 +612,30 @@ Content-Type: text/parameters\r\nContent-Length: 19\r\n\r\nwfd_video_formats\r\n
         // The spec is explicit: "A keep-alive send failure is logged, not
         // fatal; liveness is the 30 s no-traffic deadline." An earlier version
         // used `?` here and made every write fatal.
-        // arrange: a stream that refuses every write but reads normally
+        // arrange: a stream that refuses every write, and that stays silent
+        // until one has been attempted.
+        //
+        // The silence is load-bearing. An earlier version returned EOF as soon
+        // as its canned bytes ran out, so the flow was still settling before
+        // M1 when the driver hung up — no byte was ever written and the test
+        // passed whether writes were fatal or not. Holding the read open until
+        // a write has happened is what makes this exercise the write path.
         struct WriteRefusingStream {
-            canned: Vec<u8>,
+            wrote: std::sync::Arc<std::sync::atomic::AtomicBool>,
         }
         impl tokio::io::AsyncRead for WriteRefusingStream {
             fn poll_read(
-                mut self: Pin<&mut Self>,
+                self: Pin<&mut Self>,
                 _: &mut Context<'_>,
-                buf: &mut tokio::io::ReadBuf<'_>,
+                _: &mut tokio::io::ReadBuf<'_>,
             ) -> Poll<std::io::Result<()>> {
-                if self.canned.is_empty() {
-                    // A clean hangup, so the driver ends by itself rather than
-                    // spinning once the canned bytes run out.
+                if self.wrote.load(std::sync::atomic::Ordering::SeqCst) {
+                    // EOF, so the driver ends through the hangup path.
                     return Poll::Ready(Ok(()));
                 }
-                let take = self.canned.len().min(buf.remaining());
-                let bytes: Vec<u8> = self.canned.drain(..take).collect();
-                buf.put_slice(&bytes);
-                Poll::Ready(Ok(()))
+                // No waker registered on purpose: the driver's own tick wakes
+                // the select! every 100 ms and re-polls this branch.
+                Poll::Pending
             }
         }
         impl tokio::io::AsyncWrite for WriteRefusingStream {
@@ -636,6 +644,7 @@ Content-Type: text/parameters\r\nContent-Length: 19\r\n\r\nwfd_video_formats\r\n
                 _: &mut Context<'_>,
                 _: &[u8],
             ) -> Poll<std::io::Result<usize>> {
+                self.wrote.store(true, std::sync::atomic::Ordering::SeqCst);
                 Poll::Ready(Err(std::io::Error::new(
                     std::io::ErrorKind::BrokenPipe,
                     "broken pipe",
@@ -654,9 +663,10 @@ Content-Type: text/parameters\r\nContent-Length: 19\r\n\r\nwfd_video_formats\r\n
         let (sender, mut events) = mpsc::channel(8);
 
         // act: M1 cannot be written, then the sink hangs up
+        let wrote = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let outcome = drive(
             WriteRefusingStream {
-                canned: b"RTSP/1.0 200 OK\r\nCSeq: 1\r\n\r\n".to_vec(),
+                wrote: std::sync::Arc::clone(&wrote),
             },
             "192.168.1.9:7236".parse().unwrap(),
             "192.168.1.20:41234".parse().unwrap(),
@@ -669,6 +679,10 @@ Content-Type: text/parameters\r\nContent-Length: 19\r\n\r\nwfd_video_formats\r\n
         // it is reported as a teardown rather than as a write error
         assert!(outcome.is_ok(), "got: {outcome:?}");
         let event = events.recv().await.expect("the session reported its end");
+        assert!(
+            wrote.load(std::sync::atomic::Ordering::SeqCst),
+            "the test never reached a write, so it proves nothing about write failures"
+        );
         assert_eq!(
             event,
             FlowEvent::Teardown,
