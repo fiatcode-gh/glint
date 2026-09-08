@@ -10,8 +10,8 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rtsp_types::{Message, ParseError};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
 use crate::wfd::flow::{Flow, FlowEvent, Outbound};
@@ -218,8 +218,14 @@ fn session_seed(counter: u64) -> u64 {
 /// The only place elapsed time enters the protocol: `Instant` is read here and
 /// handed to the flow as a plain `Duration`, which is what keeps every
 /// deadline testable without a clock.
-async fn drive(
-    mut stream: TcpStream,
+///
+/// Generic over the stream rather than taking a `TcpStream`, because the two
+/// things that genuinely need TCP — the local and peer addresses — are already
+/// resolved by the caller and passed in. That leaves read, write and shutdown,
+/// so a test can hand it a stream that fails on demand and pin the error paths
+/// without needing a real socket to break.
+async fn drive<S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: S,
     local: SocketAddr,
     peer: SocketAddr,
     seed: u64,
@@ -331,6 +337,9 @@ async fn emit(events: &mpsc::Sender<FlowEvent>, produced: Vec<FlowEvent>) -> boo
 
 #[cfg(test)]
 mod tests {
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
     use super::*;
     use crate::link::network_manager::WFD_SOURCE_IES;
 
@@ -503,5 +512,167 @@ Content-Type: text/parameters\r\nContent-Length: 19\r\n\r\nwfd_video_formats\r\n
         let message = decoder.next().unwrap().expect("a data frame is a message");
         // assert
         assert!(matches!(message, Message::Data(_)));
+    }
+
+    /// A stream that serves canned bytes and then fails, so the driver's
+    /// error path has an oracle without needing a real socket to break.
+    ///
+    /// Exists because forcing a TCP reset portably needs `SO_LINGER`, which
+    /// tokio has deprecated and the standard library has not stabilised, and
+    /// no new dependency is permitted here. Being generic over the stream is
+    /// what makes this possible at all.
+    struct FailingStream {
+        /// Handed out before the failure, so the flow can reach a real state
+        /// rather than failing from its very first read.
+        canned: Vec<u8>,
+        /// Everything the driver wrote, for assertions.
+        written: Vec<u8>,
+        failed_yet: bool,
+    }
+
+    impl tokio::io::AsyncRead for FailingStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if !self.canned.is_empty() {
+                let take = self.canned.len().min(buf.remaining());
+                let bytes: Vec<u8> = self.canned.drain(..take).collect();
+                buf.put_slice(&bytes);
+                return Poll::Ready(Ok(()));
+            }
+            self.failed_yet = true;
+            Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "connection reset by peer",
+            )))
+        }
+    }
+
+    impl tokio::io::AsyncWrite for FailingStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.written.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_read_error_ends_the_session_with_an_event_not_in_silence() {
+        // A television that aborts with an RST rather than a FIN is the common
+        // case, and the caller is holding a live pipeline open on the strength
+        // of FlowEvent::Play. Returning the io::Error out of the driver tells
+        // it nothing, so the cast would go on being streamed at a sink that is
+        // gone. Both reviewers found this independently.
+        // arrange: the sink answers M1, then the socket dies
+        let stream = FailingStream {
+            canned: b"RTSP/1.0 200 OK\r\nCSeq: 1\r\n\r\n".to_vec(),
+            written: Vec::new(),
+            failed_yet: false,
+        };
+        let (sender, mut events) = mpsc::channel(8);
+
+        // act
+        let outcome = drive(
+            stream,
+            "192.168.1.9:7236".parse().unwrap(),
+            "192.168.1.20:41234".parse().unwrap(),
+            7,
+            &sender,
+        )
+        .await;
+
+        // assert: the driver reports the session over rather than erroring out
+        assert!(outcome.is_ok(), "got: {outcome:?}");
+        let event = events.recv().await.expect("the session reported its end");
+        let FlowEvent::Failed(reason) = event else {
+            panic!("a read error must fail the flow, got: {event:?}");
+        };
+        assert!(
+            reason.contains("socket"),
+            "the reason should name the socket, got: {reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_write_failure_is_logged_and_does_not_kill_the_flow() {
+        // The spec is explicit: "A keep-alive send failure is logged, not
+        // fatal; liveness is the 30 s no-traffic deadline." An earlier version
+        // used `?` here and made every write fatal.
+        // arrange: a stream that refuses every write but reads normally
+        struct WriteRefusingStream {
+            canned: Vec<u8>,
+        }
+        impl tokio::io::AsyncRead for WriteRefusingStream {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                if self.canned.is_empty() {
+                    // A clean hangup, so the driver ends by itself rather than
+                    // spinning once the canned bytes run out.
+                    return Poll::Ready(Ok(()));
+                }
+                let take = self.canned.len().min(buf.remaining());
+                let bytes: Vec<u8> = self.canned.drain(..take).collect();
+                buf.put_slice(&bytes);
+                Poll::Ready(Ok(()))
+            }
+        }
+        impl tokio::io::AsyncWrite for WriteRefusingStream {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                _: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "broken pipe",
+                )))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        let (sender, mut events) = mpsc::channel(8);
+
+        // act: M1 cannot be written, then the sink hangs up
+        let outcome = drive(
+            WriteRefusingStream {
+                canned: b"RTSP/1.0 200 OK\r\nCSeq: 1\r\n\r\n".to_vec(),
+            },
+            "192.168.1.9:7236".parse().unwrap(),
+            "192.168.1.20:41234".parse().unwrap(),
+            7,
+            &sender,
+        )
+        .await;
+
+        // assert: the write failure did not end the flow — the hangup did, and
+        // it is reported as a teardown rather than as a write error
+        assert!(outcome.is_ok(), "got: {outcome:?}");
+        let event = events.recv().await.expect("the session reported its end");
+        assert_eq!(
+            event,
+            FlowEvent::Teardown,
+            "a write failure must not be what ends the flow"
+        );
     }
 }
