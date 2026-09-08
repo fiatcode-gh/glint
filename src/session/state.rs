@@ -51,6 +51,11 @@ pub enum Event {
     PinRequired,
     PinEntered,
     LinkFailed,
+    /// The RTSP handshake failed on its own terms — no common video format,
+    /// HDCP demanded, a deadline breached, or the sink tore down before PLAY.
+    /// None of those is a link failure, and routing them through `LinkFailed`
+    /// would name the wrong cause in the D-Bus signal.
+    NegotiationFailed,
     NegotiationDone,
     StreamStarted,
     LinkLost,
@@ -59,7 +64,7 @@ pub enum Event {
 }
 
 impl Event {
-    pub const ALL: [Event; 12] = [
+    pub const ALL: [Event; 13] = [
         Event::ScanRequested,
         Event::ScanFinished,
         Event::ConnectRequested,
@@ -67,6 +72,7 @@ impl Event {
         Event::PinRequired,
         Event::PinEntered,
         Event::LinkFailed,
+        Event::NegotiationFailed,
         Event::NegotiationDone,
         Event::StreamStarted,
         Event::LinkLost,
@@ -158,15 +164,16 @@ mod tests {
                 Event::PinRequired => 4,
                 Event::PinEntered => 5,
                 Event::LinkFailed => 6,
-                Event::NegotiationDone => 7,
-                Event::StreamStarted => 8,
-                Event::LinkLost => 9,
-                Event::RetryTimeout => 10,
-                Event::DisconnectRequested => 11,
+                Event::NegotiationFailed => 7,
+                Event::NegotiationDone => 8,
+                Event::StreamStarted => 9,
+                Event::LinkLost => 10,
+                Event::RetryTimeout => 11,
+                Event::DisconnectRequested => 12,
             }
         }
         // The number of variants the match above enumerates.
-        const VARIANTS: usize = 12;
+        const VARIANTS: usize = 13;
 
         // act & assert
         assert_eq!(Event::ALL.len(), VARIANTS);

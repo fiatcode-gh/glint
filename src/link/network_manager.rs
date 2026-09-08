@@ -143,7 +143,9 @@ trait SettingsConnection {
 /// sinks have actually accepted, so do not "correct" it without testing
 /// against a real sink), control port 0x1c44 = 7236, max throughput
 /// 0x00c8 = 200.
-const WFD_SOURCE_IES: [u8; 9] = [0x00, 0x00, 0x06, 0x00, 0x90, 0x1c, 0x44, 0x00, 0xc8];
+/// `pub(crate)` so `wfd::rtsp` can assert its control port against
+/// `RTSP_PORT`: the advertisement and the listener must not drift apart.
+pub(crate) const WFD_SOURCE_IES: [u8; 9] = [0x00, 0x00, 0x06, 0x00, 0x90, 0x1c, 0x44, 0x00, 0xc8];
 
 /// A peer as NetworkManager reports it, before glint has decided whether it
 /// is a Wi-Fi Display sink at all. `Peer` is what the link layer promises

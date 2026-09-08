@@ -24,6 +24,15 @@ impl H264Profile {
             H264Profile::ConstrainedHigh => 1,
         }
     }
+
+    /// The profile as its `wfd_video_formats` bit. The consts above stay the
+    /// source of truth; the M4 body has to emit one of them.
+    pub fn bit(self) -> u8 {
+        match self {
+            H264Profile::ConstrainedBaseline => Self::CBP_BIT,
+            H264Profile::ConstrainedHigh => Self::CHP_BIT,
+        }
+    }
 }
 
 /// The best profile both sides support, if any.
@@ -44,6 +53,10 @@ pub struct ChosenFormat {
     pub height: u32,
     pub fps: u32,
     pub profile: H264Profile,
+    /// Copied from the sink codec entry that won, never chosen by us: M4
+    /// echoes the sink's own declared level back at it, which is GND's rule.
+    /// Carried but never ranked — it is a declaration, not a preference.
+    pub level: u8,
 }
 
 impl ChosenFormat {
@@ -112,6 +125,7 @@ pub fn negotiate(
                         height: mode.height,
                         fps: mode.fps,
                         profile,
+                        level: their_codec.level,
                     };
                     if best.is_none_or(|current| candidate.key() > current.key()) {
                         best = Some(candidate);
@@ -330,5 +344,32 @@ mod tests {
         let result = negotiate(&ours, &empty, &ContentProtection::None);
         // assert
         assert_eq!(result, Err(NegotiationError::NoCommonFormat));
+    }
+
+    #[test]
+    fn the_profile_bits_are_readable_without_reaching_into_the_consts() {
+        // The M4 body must emit the chosen profile as its bit. The private
+        // consts stay the source of truth; this is their public reading.
+        // act & assert
+        assert_eq!(H264Profile::ConstrainedBaseline.bit(), 0x01);
+        assert_eq!(H264Profile::ConstrainedHigh.bit(), 0x02);
+    }
+
+    #[test]
+    fn the_chosen_format_carries_the_level_of_the_sink_entry_that_won() {
+        // GND echoes the sink's own level back in M4. Two sink entries with
+        // different levels: the one holding the winning mode decides.
+        // arrange
+        let ours = formats(vec![codec(CBP | CHP, CEA_1080P60 | CEA_720P60, 0, 0)]);
+        let mut low = codec(CBP, CEA_720P60, 0, 0);
+        low.level = 0x02;
+        let mut high = codec(CBP, CEA_1080P60, 0, 0);
+        high.level = 0x10;
+        let theirs = formats(vec![low, high]);
+        // act
+        let chosen = negotiate(&ours, &theirs, &ContentProtection::None).unwrap();
+        // assert
+        assert_eq!((chosen.width, chosen.height), (1920, 1080));
+        assert_eq!(chosen.level, 0x10);
     }
 }

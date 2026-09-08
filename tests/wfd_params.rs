@@ -186,11 +186,15 @@ fn a_non_hex_video_field_is_rejected() {
 /// The committed `tests/fixtures/m3_reply_video_formats.txt` is a synthetic
 /// placeholder: it holds a byte-identical copy of `VIDEO_ONE_CODEC` above, so
 /// running this test with `--ignored` passes and proves nothing at all.
-/// Milestone 2, Task 24 replaces the file with a real television's M3 reply;
-/// only from then does a green run mean anything. Until then the test stays
-/// ignored and named, so the gap is visible instead of hidden.
+///
+/// The capture is now blocked on follow-up 9, the Wi-Fi Direct group-formation
+/// failure below NetworkManager — no sink can reach the RTSP listener until
+/// that is resolved, so no real M3 reply can be observed. `examples/cast.rs`
+/// is the instrument: it prints the raw reply body verbatim, and that text
+/// replaces this file. Until then the test stays ignored and named, so the gap
+/// is visible instead of hidden.
 #[test]
-#[ignore = "the committed fixture is a synthetic placeholder; the real-TV M3 reply arrives with Milestone 2, Task 24"]
+#[ignore = "the committed fixture is a synthetic placeholder; capturing a real television's M3 reply is blocked on follow-up 9, the P2P group-formation failure"]
 fn the_real_sink_reply_fixture_round_trips() {
     // arrange
     let fixture = include_str!("fixtures/m3_reply_video_formats.txt").trim();
@@ -198,4 +202,21 @@ fn the_real_sink_reply_fixture_round_trips() {
     let parsed = VideoFormats::parse(fixture).unwrap();
     // assert
     assert_eq!(parsed.format(), fixture);
+}
+
+#[test]
+fn an_empty_codec_list_formats_without_a_trailing_space() {
+    // Unreachable through `parse`, which demands at least one codec entry,
+    // and the M4 builder always constructs exactly one — so nothing in the
+    // tree reaches this today. It is pinned because `VideoFormats` is public
+    // with public fields, so the empty case is constructible by any caller,
+    // and a trailing space would land on the wire.
+    // arrange
+    let empty = VideoFormats {
+        native: 0,
+        preferred_display_mode: 0,
+        codecs: Vec::new(),
+    };
+    // act & assert
+    assert_eq!(empty.format(), "00 00");
 }

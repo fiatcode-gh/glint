@@ -18,6 +18,7 @@ const TABLE: &[(State, Event, State, &[Action])] = &[
     (Pairing, LinkFailed, Idle, &[TearDownLink]),
     (Negotiating, NegotiationDone, Negotiating, &[StartPipeline]),
     (Negotiating, StreamStarted, Streaming, &[]),
+    (Negotiating, NegotiationFailed, Idle, &[TearDownLink]),
     (
         Negotiating,
         LinkLost,
@@ -70,9 +71,9 @@ fn every_row_of_the_transition_table_holds() {
 }
 
 #[test]
-fn the_table_covers_exactly_twenty_one_transitions() {
+fn the_table_covers_exactly_twenty_two_transitions() {
     // A new arm in step() that nobody added to TABLE would otherwise go unpinned.
-    assert_eq!(TABLE.len(), 21);
+    assert_eq!(TABLE.len(), 22);
 
     // The sweep proves step's arms are all in TABLE, and the row test proves
     // TABLE's rows are all in step. Set equality needs distinctness too: a
@@ -125,7 +126,7 @@ fn transitions_outside_the_table_are_rejected() {
 
 #[test]
 fn every_state_event_pair_is_either_in_the_table_or_rejected() {
-    // Exhaustive sweep: 7 states x 12 events. Nothing may panic, and anything
+    // Exhaustive sweep: 7 states x 13 events. Nothing may panic, and anything
     // that succeeds must be a row of TABLE.
     for state in State::ALL {
         for event in Event::ALL {

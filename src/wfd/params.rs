@@ -178,13 +178,11 @@ impl WfdParam for VideoFormats {
         let mut out = String::new();
         let _ = write!(
             out,
-            "{:02x} {:02x} ",
+            "{:02x} {:02x}",
             self.native, self.preferred_display_mode
         );
         for (index, codec) in self.codecs.iter().enumerate() {
-            if index > 0 {
-                out.push_str(", ");
-            }
+            out.push_str(if index == 0 { " " } else { ", " });
             codec.format_into(&mut out);
         }
         out
